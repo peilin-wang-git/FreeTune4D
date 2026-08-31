@@ -726,15 +726,47 @@ if __name__ == '__main__':
 
     dcm_files = sorted(glob.glob(os.path.join(FourD_path, '*.dcm')))
     print(f"[main] number of THRIVE DICOM files = {len(dcm_files)}", flush=True)
+    if not dcm_files:
+        raise FileNotFoundError(f"No .dcm files found in dynamic DICOM directory: {FourD_path}")
 
     info = pydicom.dcmread(dcm_files[0])
     nTP = int(info.NumberOfTemporalPositions)
     print(f"[main] NumberOfTemporalPositions = {nTP}", flush=True)
+    if nTP <= 0:
+        raise ValueError(f"NumberOfTemporalPositions must be positive; got {nTP}.")
+    if len(dcm_files) % nTP != 0:
+        raise ValueError(
+            f"Dynamic DICOM file count {len(dcm_files)} is not divisible by "
+            f"NumberOfTemporalPositions {nTP}; slice/time ordering is incomplete."
+        )
 
     FourD, FourD_pos, FourD_vs = load_image(FourD_path, time_index=0, pattern='IM-*', dims=None, nTP=nTP)
     print(f"[main] FourD shape = {FourD.shape}", flush=True)
     print(f"[main] FourD_pos shape = {FourD_pos.shape}", flush=True)
     print(f"[main] FourD_vs = {FourD_vs}", flush=True)
+
+    # Lightweight diagnostics before the first CUDA operation (NCC clustering).
+    print("\n[preflight] dynamic DICOM / CUDA validation", flush=True)
+    print(f"[preflight] selected modality       = T2", flush=True)
+    print(f"[preflight] DICOM files             = {len(dcm_files)}", flush=True)
+    print(f"[preflight] temporal positions      = {nTP}", flush=True)
+    print(f"[preflight] loaded volume shape     = {FourD.shape}", flush=True)
+    print(f"[preflight] loaded volume dtype     = {FourD.dtype}", flush=True)
+    print(f"[preflight] loaded intensity range  = ({np.min(FourD)}, {np.max(FourD)})", flush=True)
+    print(f"[preflight] requested output phases = {arg.phase_num}", flush=True)
+    print(f"[preflight] CUDA device             = cuda:0", flush=True)
+    if FourD.ndim != 4 or any(size <= 0 for size in FourD.shape):
+        raise ValueError(f"Dynamic DICOM must produce a non-empty 4D volume; got shape {FourD.shape}.")
+    if FourD.shape[-1] != nTP:
+        raise ValueError(f"Loaded temporal dimension {FourD.shape[-1]} does not match NumberOfTemporalPositions {nTP}.")
+    if FourD.shape[-1] < arg.phase_num:
+        raise ValueError(f"Cannot create {arg.phase_num} phases from only {FourD.shape[-1]} temporal frames.")
+    if not np.isfinite(FourD).all():
+        raise ValueError("Dynamic DICOM volume contains NaN or Inf values before CUDA clustering.")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA device cuda:0 is required by preprocessing but is not available.")
+    print(f"[preflight] CUDA device name        = {torch.cuda.get_device_name(0)}", flush=True)
+    print("[preflight] dynamic input is valid for NCC clustering", flush=True)
 
     FourD_all = FourD.copy()
     full_data_path = os.path.join(patient_path, 'Full_data.mat')
@@ -769,6 +801,13 @@ if __name__ == '__main__':
     print(f"[main] T2 shape = {T2.shape}", flush=True)
     print(f"[main] T2_pos shape = {T2_pos.shape}", flush=True)
     print(f"[main] T2_vs = {T2_vs}", flush=True)
+    print(f"[preflight] static volume shape     = {T2.shape}", flush=True)
+    print(f"[preflight] static volume dtype     = {T2.dtype}", flush=True)
+    print(f"[preflight] static intensity range  = ({np.min(T2)}, {np.max(T2)})", flush=True)
+    if T2.ndim != 3 or any(size <= 0 for size in T2.shape):
+        raise ValueError(f"Static DICOM must produce a non-empty 3D volume; got shape {T2.shape}.")
+    if not np.isfinite(T2).all():
+        raise ValueError("Static DICOM volume contains NaN or Inf values before CUDA axial matching.")
 
     # --- Save GIFs for Demo ---
     print("\n[main] generating GIFs...", flush=True)
