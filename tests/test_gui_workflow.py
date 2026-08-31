@@ -5,11 +5,16 @@ import unittest
 from freetune4d_gui.backend import BackendError, FreeTune4DBackend, PipelineConfig
 from freetune4d_gui.app import FreeTune4DApp
 from freetune4d_gui.controller import WorkflowController, WorkflowState
+from freetune4d_gui.devices import DeviceInfo, select_device
 from freetune4d_gui.typography import TYPOGRAPHY
 
 
 class SimulatedBackend(FreeTune4DBackend):
     """Executes adapter behavior while simulating only the unavailable subprocess."""
+
+    def __init__(self, repo_root):
+        device = DeviceInfo(2, "Test GPU", 24 * 1024**3, 20 * 1024**3)
+        super().__init__(repo_root, device_detector=lambda: [device])
 
     def _run(self, operation, command, cwd, log, env=None):
         self.last_operation = operation
@@ -109,6 +114,13 @@ class BackendAdapterTests(unittest.TestCase):
         self.assertIn("Exact command:", "\n".join(logs))
         self.assertIn("[stderr]", "\n".join(logs))
 
+    def test_cuda_out_of_memory_has_specific_category(self):
+        kind, message = FreeTune4DBackend._classify_failure(
+            "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 932.00 MiB"
+        )
+        self.assertEqual("cuda_oom", kind)
+        self.assertIn("OutOfMemoryError", message)
+
     def test_cuda_diagnostic_mode_is_scoped_to_backend_child(self):
         diagnostic = PipelineConfig(**{**self.config.__dict__, "cuda_diagnostics": True})
         self.backend.run_preprocessing(diagnostic, lambda _line: None)
@@ -171,6 +183,15 @@ class WorkflowStateTests(unittest.TestCase):
         self.assertEqual(WorkflowState.PREPROCESSED, self.controller.state)
         self.assertTrue(self.controller.can_reconstruct)
 
+    def test_compute_device_change_preserves_device_independent_preprocessing(self):
+        self.controller.inputs_validated(self.config, [])
+        self.controller.start_preprocessing()
+        self.controller.preprocessing_succeeded()
+        changed = PipelineConfig(**{**self.config.__dict__, "compute_device": "cuda:2"})
+        self.controller.inputs_validated(changed, [])
+        self.assertEqual(WorkflowState.PREPROCESSED, self.controller.state)
+        self.assertTrue(self.controller.preprocessing_valid)
+
 
 class GuiLayoutContractTests(unittest.TestCase):
     def test_readable_fonts_and_responsive_layout_contract(self):
@@ -183,6 +204,24 @@ class GuiLayoutContractTests(unittest.TestCase):
         self.assertEqual(15, FreeTune4DApp.FONT_SIZES["log"])
         self.assertGreaterEqual(TYPOGRAPHY.CONTROL_HEIGHT_PX, 36)
         self.assertGreaterEqual(TYPOGRAPHY.PRIMARY_HEIGHT_PX, 44)
+
+
+class DeviceSelectionTests(unittest.TestCase):
+    def test_auto_selects_gpu_with_most_free_memory(self):
+        devices = [
+            DeviceInfo(0, "Busy GPU", 24 * 1024**3, 200 * 1024**2),
+            DeviceInfo(1, "Available GPU", 24 * 1024**3, 20 * 1024**3),
+        ]
+        self.assertEqual(1, select_device("auto", devices).physical_index)
+        self.assertTrue(devices[0].low_memory)
+
+    def test_manual_physical_gpu_is_isolated_for_child(self):
+        device = DeviceInfo(2, "Selected GPU", 24 * 1024**3, 18 * 1024**3)
+        backend = FreeTune4DBackend(device_detector=lambda: [device])
+        config = PipelineConfig(Path("."), Path("."), Path("."), compute_device="cuda:2")
+        env = {}
+        backend._configure_device_environment(config, env, lambda _message: None)
+        self.assertEqual("2", env["CUDA_VISIBLE_DEVICES"])
 
 
 if __name__ == "__main__":
