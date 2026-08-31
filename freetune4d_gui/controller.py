@@ -27,18 +27,26 @@ class WorkflowController:
 
     def inputs_validated(self, config: PipelineConfig, errors: list[str]) -> None:
         signature = config.signature()
-        if signature != self.config_signature:
+        signature_changed = signature != self.config_signature
+        if signature_changed:
             self.config_signature = signature
             self.preprocessing_valid = False
         if self.state not in {WorkflowState.PREPROCESSING, WorkflowState.RECONSTRUCTING}:
-            self.state = WorkflowState.READY if not errors else WorkflowState.INVALID
-            self.failure_stage = None
+            if errors:
+                self.state = WorkflowState.INVALID
+                self.preprocessing_valid = False
+                self.failure_stage = None
+            elif signature_changed or self.state == WorkflowState.INVALID:
+                self.state = WorkflowState.READY
+                self.failure_stage = None
 
     def start_preprocessing(self) -> None:
-        if self.state != WorkflowState.READY:
+        retrying_failed_preprocessing = self.state == WorkflowState.FAILED and self.failure_stage == "preprocessing"
+        if self.state != WorkflowState.READY and not retrying_failed_preprocessing:
             raise RuntimeError("Preprocessing can only start from the ready state.")
         self.state = WorkflowState.PREPROCESSING
         self.preprocessing_valid = False
+        self.failure_stage = None
 
     def preprocessing_succeeded(self) -> None:
         if self.state != WorkflowState.PREPROCESSING:
@@ -47,9 +55,11 @@ class WorkflowController:
         self.preprocessing_valid = True
 
     def start_reconstruction(self) -> None:
-        if self.state != WorkflowState.PREPROCESSED or not self.preprocessing_valid:
+        retrying_failed_reconstruction = self.state == WorkflowState.FAILED and self.failure_stage == "reconstruction"
+        if (self.state != WorkflowState.PREPROCESSED and not retrying_failed_reconstruction) or not self.preprocessing_valid:
             raise RuntimeError("Reconstruction requires successful preprocessing for the current case.")
         self.state = WorkflowState.RECONSTRUCTING
+        self.failure_stage = None
 
     def reconstruction_succeeded(self) -> None:
         if self.state != WorkflowState.RECONSTRUCTING:
@@ -76,8 +86,9 @@ class WorkflowController:
 
     @property
     def can_preprocess(self) -> bool:
-        return self.state == WorkflowState.READY
+        return self.state == WorkflowState.READY or (self.state == WorkflowState.FAILED and self.failure_stage == "preprocessing")
 
     @property
     def can_reconstruct(self) -> bool:
-        return self.state == WorkflowState.PREPROCESSED and self.preprocessing_valid
+        valid_state = self.state == WorkflowState.PREPROCESSED or (self.state == WorkflowState.FAILED and self.failure_stage == "reconstruction")
+        return valid_state and self.preprocessing_valid

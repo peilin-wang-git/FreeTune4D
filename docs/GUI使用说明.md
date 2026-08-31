@@ -29,6 +29,8 @@ python -m freetune4d_gui
 6. 输入和资源全部有效后，**Preprocessing** 才会启用；运行成功后 **Motion Reconstruction** 才会启用。
 7. 重建完成后，界面验证 UQ DICOM、LQ DICOM 和 QC 文件并显示实际文件数和相位数。
 
+界面默认窗口为 1280×840，最小尺寸为 1100×720。上半部使用约 65:35 的“输入与配置／工作流与状态”双栏布局；下半部 Runtime Log 通过分隔条调整高度。标题、章节、正文、按钮和日志分别使用约 24、16、13、14 和 12 的字体尺寸，并在 Windows 上启用系统 DPI 感知。
+
 ## 输出结构
 
 ```text
@@ -55,6 +57,16 @@ python -m freetune4d_gui
 两个原后端脚本均由工作线程启动的独立子进程执行。GUI 线程只接收日志和完成/失败事件，因此长任务不会阻塞界面；TensorFlow/PyTorch/CUDA 行为仍由原脚本决定。界面不显示虚构百分比，只使用不定进度条，并流式显示后端真实输出。
 
 后端非零退出、缺少权重、无 DICOM、T1 不支持、预处理清单不匹配或输出缺失都会形成明确错误。详细 traceback 保留在 Runtime Log。已有受管输出不会被静默删除，重新预处理或重建前会要求确认。
+
+### CUDA 诊断模式
+
+如果 Runtime Log 中出现 CUDA 异步错误，可在 **Advanced Settings** 中临时启用：
+
+```text
+CUDA diagnostic mode (CUDA_LAUNCH_BLOCKING=1; slower)
+```
+
+该选项只向本次后端子进程注入 `CUDA_LAUNCH_BLOCKING=1`，不会修改主 GUI 进程或永久环境。同步执行会降低速度，因此正常运行时应关闭。失败时 Runtime Log 会分别保留 stdout、stderr、准确命令、工作目录、退出码和末尾 traceback；“Copy Error”可复制结构化诊断信息。
 
 ## 当前部署前提
 

@@ -3,13 +3,16 @@ import tempfile
 import unittest
 
 from freetune4d_gui.backend import BackendError, FreeTune4DBackend, PipelineConfig
+from freetune4d_gui.app import FreeTune4DApp
 from freetune4d_gui.controller import WorkflowController, WorkflowState
 
 
 class SimulatedBackend(FreeTune4DBackend):
     """Executes adapter behavior while simulating only the unavailable subprocess."""
 
-    def _run(self, command, cwd, log, env=None):
+    def _run(self, operation, command, cwd, log, env=None):
+        self.last_operation = operation
+        self.last_env = env or {}
         log("simulated subprocess: " + " ".join(command))
         if self.PREPROCESS_SCRIPT in command[1]:
             base = Path(command[command.index("--base_path") + 1])
@@ -87,6 +90,30 @@ class BackendAdapterTests(unittest.TestCase):
         with self.assertRaises(BackendError):
             self.backend.run_motion_reconstruction(changed)
 
+    def test_structured_process_error_retains_both_streams_and_root_cause(self):
+        logs = []
+        command = [
+            self.backend.python_executable,
+            "-c",
+            "import sys; print('normal context'); print('RuntimeError: CUDA device-side assert triggered', file=sys.stderr); raise SystemExit(7)",
+        ]
+        with self.assertRaises(BackendError) as caught:
+            FreeTune4DBackend._run("preprocessing", command, Path(self.temp.name), logs.append)
+        error = caught.exception
+        self.assertEqual("cuda", error.kind)
+        self.assertEqual(7, error.exit_code)
+        self.assertIn("normal context", error.stdout_tail)
+        self.assertIn("device-side assert", error.stderr_tail)
+        self.assertEqual("RuntimeError: CUDA device-side assert triggered", error.root_message)
+        self.assertIn("Exact command:", "\n".join(logs))
+        self.assertIn("[stderr]", "\n".join(logs))
+
+    def test_cuda_diagnostic_mode_is_scoped_to_backend_child(self):
+        diagnostic = PipelineConfig(**{**self.config.__dict__, "cuda_diagnostics": True})
+        self.backend.run_preprocessing(diagnostic, lambda _line: None)
+        self.assertEqual("1", self.backend.last_env.get("CUDA_LAUNCH_BLOCKING"))
+        self.assertNotEqual("1", __import__("os").environ.get("CUDA_LAUNCH_BLOCKING"))
+
 
 class WorkflowStateTests(unittest.TestCase):
     def setUp(self):
@@ -123,6 +150,36 @@ class WorkflowStateTests(unittest.TestCase):
         self.controller.recover_after_failure()
         self.assertEqual(WorkflowState.READY, self.controller.state)
         self.assertFalse(self.controller.can_reconstruct)
+
+    def test_failed_preprocessing_is_visible_but_retryable(self):
+        self.controller.inputs_validated(self.config, [])
+        self.controller.start_preprocessing()
+        self.controller.operation_failed("preprocessing")
+        self.assertEqual(WorkflowState.FAILED, self.controller.state)
+        self.assertTrue(self.controller.can_preprocess)
+        self.assertFalse(self.controller.can_reconstruct)
+        self.controller.start_preprocessing()
+        self.assertEqual(WorkflowState.PREPROCESSING, self.controller.state)
+
+    def test_cuda_diagnostic_toggle_does_not_invalidate_preprocessing(self):
+        self.controller.inputs_validated(self.config, [])
+        self.controller.start_preprocessing()
+        self.controller.preprocessing_succeeded()
+        diagnostic = PipelineConfig(**{**self.config.__dict__, "cuda_diagnostics": True})
+        self.controller.inputs_validated(diagnostic, [])
+        self.assertEqual(WorkflowState.PREPROCESSED, self.controller.state)
+        self.assertTrue(self.controller.can_reconstruct)
+
+
+class GuiLayoutContractTests(unittest.TestCase):
+    def test_readable_fonts_and_responsive_layout_contract(self):
+        self.assertEqual((65, 35), FreeTune4DApp.COLUMN_WEIGHTS)
+        self.assertGreaterEqual(FreeTune4DApp.MINIMUM_SIZE[0], 1100)
+        self.assertGreaterEqual(FreeTune4DApp.MINIMUM_SIZE[1], 720)
+        self.assertGreaterEqual(FreeTune4DApp.FONT_SIZES["title"], 22)
+        self.assertGreaterEqual(FreeTune4DApp.FONT_SIZES["section"], 16)
+        self.assertGreaterEqual(FreeTune4DApp.FONT_SIZES["normal"], 13)
+        self.assertGreaterEqual(FreeTune4DApp.FONT_SIZES["log"], 12)
 
 
 if __name__ == "__main__":
