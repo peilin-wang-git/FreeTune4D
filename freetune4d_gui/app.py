@@ -14,10 +14,12 @@ import sys
 import threading
 import traceback
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
 
 from .backend import BackendError, FreeTune4DBackend, OutputSummary, PipelineConfig
 from .controller import WorkflowController, WorkflowState
+from .typography import TYPOGRAPHY, configure_named_fonts
 
 
 class FreeTune4DApp(tk.Tk):
@@ -25,7 +27,12 @@ class FreeTune4DApp(tk.Tk):
     WINDOW_SIZE = (1280, 840)
     MINIMUM_SIZE = (1100, 720)
     COLUMN_WEIGHTS = (65, 35)
-    FONT_SIZES = {"title": 24, "section": 16, "normal": 13, "button": 14, "status": 13, "log": 12}
+    FONT_SIZES = {
+        "title": TYPOGRAPHY.TITLE_PX,
+        "section": TYPOGRAPHY.SECTION_PX,
+        "normal": TYPOGRAPHY.BODY_PX,
+        "log": TYPOGRAPHY.LOG_PX,
+    }
 
     def __init__(self, backend: FreeTune4DBackend | None = None):
         super().__init__()
@@ -46,6 +53,8 @@ class FreeTune4DApp(tk.Tk):
         self._build_ui()
         self.after(self.POLL_MS, self._poll_events)
         self._validate_form(log_success=False)
+        if os.environ.get("FREETUNE4D_DEBUG_UI") == "1":
+            self.after_idle(self._print_ui_diagnostics)
 
     def _create_variables(self) -> None:
         repo = self.backend.repo_root
@@ -77,44 +86,52 @@ class FreeTune4DApp(tk.Tk):
             variable.trace_add("write", self._on_config_changed)
 
     def _configure_style(self) -> None:
-        # Use explicit, moderate fonts instead of an oversized global Tk scale.
-        fonts = self.FONT_SIZES
-        self.option_add("*Font", ("TkDefaultFont", fonts["normal"]))
-        self.option_add("*Text.Font", ("TkFixedFont", fonts["log"]))
+        self.fonts = configure_named_fonts(self)
+        self.option_add("*Font", "FreeTune4DBody")
+        self.option_add("*Text.Font", "FreeTune4DBody")
         style = ttk.Style(self)
         if "clam" in style.theme_names():
             style.theme_use("clam")
-        style.configure("TLabel", font=("TkDefaultFont", 13))
-        style.configure("TEntry", font=("TkDefaultFont", 13), padding=(8, 7))
-        style.configure("TCombobox", font=("TkDefaultFont", 13), padding=(8, 6))
-        style.configure("TSpinbox", font=("TkDefaultFont", 13), padding=(8, 6))
-        style.configure("TButton", font=("TkDefaultFont", 13), padding=(12, 7))
-        style.configure("Header.TLabel", font=("TkDefaultFont", fonts["title"], "bold"), foreground="#17324d")
-        style.configure("Subheader.TLabel", font=("TkDefaultFont", 14), foreground="#526577")
-        style.configure("Section.TLabelframe.Label", font=("TkDefaultFont", fonts["section"], "bold"), foreground="#17324d")
+        body_linespace = self.fonts["body"].metrics("linespace")
+        control_y_padding = max(1, (TYPOGRAPHY.CONTROL_HEIGHT_PX - body_linespace) // 2)
+        primary_y_padding = max(1, (TYPOGRAPHY.PRIMARY_HEIGHT_PX - body_linespace) // 2)
+        style.configure("TLabel", font="FreeTune4DBody")
+        style.configure("TEntry", font="FreeTune4DBody", padding=(8, control_y_padding))
+        style.configure("TCombobox", font="FreeTune4DBody", padding=(8, control_y_padding))
+        style.configure("TSpinbox", font="FreeTune4DBody", padding=(8, control_y_padding))
+        style.configure("TButton", font="FreeTune4DBody", padding=(12, control_y_padding))
+        style.configure("Header.TLabel", font="FreeTune4DTitle", foreground="#17324d")
+        style.configure("Subheader.TLabel", font="FreeTune4DBody", foreground="#526577")
+        style.configure("Section.TLabel", font="FreeTune4DSection", foreground="#17324d")
+        style.configure("Section.TLabelframe.Label", font="FreeTune4DSection", foreground="#17324d")
         style.configure("Section.TLabelframe", borderwidth=1, relief="solid")
-        style.configure("Primary.TButton", font=("TkDefaultFont", 14, "bold"), padding=(16, 11))
-        style.configure("StatusName.TLabel", font=("TkDefaultFont", 13, "bold"))
-        style.configure("Status.TLabel", font=("TkDefaultFont", 13, "bold"), padding=(9, 6), background="#edf2f6")
-        style.configure("Operation.TLabel", font=("TkDefaultFont", 14, "bold"), foreground="#17324d")
-        style.configure("Link.TButton", font=("TkDefaultFont", 12), padding=(10, 6))
+        style.configure("Primary.TButton", font="FreeTune4DBodyBold", padding=(16, primary_y_padding))
+        style.configure("StatusName.TLabel", font="FreeTune4DBodyBold")
+        style.configure("Status.TLabel", font="FreeTune4DBody", padding=(9, 6), background="#edf2f6")
+        style.configure("Operation.TLabel", font="FreeTune4DBodyBold", foreground="#17324d")
+        style.configure("Link.TButton", font="FreeTune4DBody", padding=(10, control_y_padding))
 
     def _build_ui(self) -> None:
-        outer = ttk.Frame(self, padding=(20, 16))
+        outer = ttk.Frame(self, name="central_widget", padding=(20, 16))
+        self.central_widget = outer
         outer.pack(fill="both", expand=True)
         outer.rowconfigure(1, weight=1)
         outer.columnconfigure(0, weight=1)
         header = ttk.Frame(outer)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 14))
-        ttk.Label(header, text="FreeTune4D", style="Header.TLabel").pack(anchor="w")
+        self.page_title = ttk.Label(header, name="page_title", text="FreeTune4D", style="Header.TLabel")
+        self.page_title.pack(anchor="w")
         ttk.Label(header, text="UQ 4D-MRI Motion Reconstruction", style="Subheader.TLabel").pack(anchor="w")
 
         self.vertical_panes = ttk.Panedwindow(outer, orient="vertical")
         self.vertical_panes.grid(row=1, column=0, sticky="nsew")
         upper = ttk.Frame(self.vertical_panes)
-        log_frame = ttk.Labelframe(self.vertical_panes, text="Runtime Log", padding=8, style="Section.TLabelframe")
-        self.vertical_panes.add(upper, weight=7)
-        self.vertical_panes.add(log_frame, weight=3)
+        log_frame = ttk.Labelframe(self.vertical_panes, name="runtime_log_section", text="Runtime Log", padding=8, style="Section.TLabelframe")
+        self.log_frame = log_frame
+        # Let the configuration/workflow area request its natural height; the
+        # Runtime Log receives the remaining flexible vertical space.
+        self.vertical_panes.add(upper, weight=0)
+        self.vertical_panes.add(log_frame, weight=1)
 
         upper.columnconfigure(0, weight=self.COLUMN_WEIGHTS[0], uniform="main-columns", minsize=620)
         upper.columnconfigure(1, weight=self.COLUMN_WEIGHTS[1], uniform="main-columns", minsize=390)
@@ -124,7 +141,8 @@ class FreeTune4DApp(tk.Tk):
         left.grid(row=0, column=0, sticky="nsew")
         right.grid(row=0, column=1, sticky="nsew")
 
-        input_frame = ttk.Labelframe(left, text="Input Data", padding=14, style="Section.TLabelframe")
+        input_frame = ttk.Labelframe(left, name="input_data_section", text="Input Data", padding=14, style="Section.TLabelframe")
+        self.input_frame = input_frame
         input_frame.pack(fill="x", pady=(0, 14))
         input_frame.columnconfigure(0, weight=1)
         self.dynamic_entry, self.dynamic_browse = self._path_row(
@@ -137,7 +155,8 @@ class FreeTune4DApp(tk.Tk):
             "High-quality 3D MRI providing anatomical prior information.",
             self.static_var, lambda: self._browse_directory(self.static_var),
         )
-        ttk.Label(input_frame, text="MRI Modality", style="StatusName.TLabel").grid(row=6, column=0, columnspan=2, sticky="w", pady=(10, 4))
+        self.modality_label = ttk.Label(input_frame, name="mri_modality_label", text="MRI Modality", style="StatusName.TLabel")
+        self.modality_label.grid(row=6, column=0, columnspan=2, sticky="w", pady=(10, 4))
         self.modality_combo = ttk.Combobox(input_frame, textvariable=self.modality_var, values=("T2-weighted", "T1-weighted"), state="readonly", width=22)
         self.modality_combo.grid(row=7, column=0, sticky="w", pady=(0, 5))
         self.modality_note = ttk.Label(input_frame, text="T2 backend available; T1 backend is not present.", foreground="#7a5a00")
@@ -154,7 +173,7 @@ class FreeTune4DApp(tk.Tk):
         self.advanced = ttk.Frame(left)
         self.advanced.pack(fill="x")
         self.advanced_visible = tk.BooleanVar(value=False)
-        self.advanced_toggle = ttk.Button(self.advanced, text="Advanced Settings ▸", command=self._toggle_advanced)
+        self.advanced_toggle = ttk.Button(self.advanced, name="advanced_settings", text="Advanced Settings ▸", command=self._toggle_advanced)
         self.advanced_toggle.grid(row=0, column=0, sticky="ew")
         self.advanced.columnconfigure(0, weight=1)
         self.advanced_body = ttk.Labelframe(self.advanced, text="Backend Settings", padding=12, style="Section.TLabelframe")
@@ -173,21 +192,28 @@ class FreeTune4DApp(tk.Tk):
         self.advanced_controls.append(self.cuda_diagnostics_check)
         self.advanced_body.columnconfigure(1, weight=1)
 
-        workflow = ttk.Labelframe(right, text="Reconstruction Workflow", padding=16, style="Section.TLabelframe")
-        workflow.pack(fill="both", expand=True)
+        workflow = ttk.Labelframe(right, name="workflow_section", text="Reconstruction Workflow", padding=16, style="Section.TLabelframe")
+        self.workflow_frame = workflow
+        workflow.pack(fill="x")
         status_grid = ttk.Frame(workflow)
         status_grid.pack(fill="x")
+        self.workflow_name_labels = []
+        self.workflow_status_labels = []
         for row, (number, title, variable) in enumerate((
             ("1", "Input", self.input_status_var),
             ("2", "Preprocessing", self.preprocess_status_var),
             ("3", "Motion Reconstruction", self.reconstruct_status_var),
             ("4", "Output", self.output_status_var),
         )):
-            ttk.Label(status_grid, text=number, font=("TkDefaultFont", 15, "bold"), width=3).grid(row=row, column=0, sticky="nw", pady=8)
+            ttk.Label(status_grid, text=number, style="StatusName.TLabel", width=3).grid(row=row, column=0, sticky="nw", pady=8)
             item = ttk.Frame(status_grid)
             item.grid(row=row, column=1, sticky="ew", pady=8)
-            ttk.Label(item, text=title, style="StatusName.TLabel").pack(anchor="w")
-            ttk.Label(item, textvariable=variable, style="Status.TLabel").pack(anchor="w", pady=(3, 0))
+            name_label = ttk.Label(item, text=title, style="StatusName.TLabel")
+            name_label.pack(anchor="w")
+            status_label = ttk.Label(item, textvariable=variable, style="Status.TLabel")
+            status_label.pack(anchor="w", pady=(3, 0))
+            self.workflow_name_labels.append(name_label)
+            self.workflow_status_labels.append(status_label)
         status_grid.columnconfigure(1, weight=1)
 
         self.preprocess_button = ttk.Button(workflow, text="Preprocessing", style="Primary.TButton", command=self._start_preprocessing)
@@ -196,14 +222,16 @@ class FreeTune4DApp(tk.Tk):
         self.reconstruct_button.pack(fill="x", pady=(0, 16))
 
         operation = ttk.Labelframe(workflow, text="Current Operation", padding=12, style="Section.TLabelframe")
+        self.operation_frame = operation
         operation.pack(fill="x", pady=(0, 14))
         ttk.Label(operation, textvariable=self.overall_status_var, style="Operation.TLabel", wraplength=360).pack(anchor="w", fill="x")
         self.activity = ttk.Progressbar(operation, mode="indeterminate")
         self.activity.pack(fill="x", pady=(10, 0))
 
         results = ttk.Labelframe(workflow, text="Output Summary", padding=12, style="Section.TLabelframe")
+        self.results_frame = results
         results.pack(fill="both", expand=True)
-        self.results_text = tk.Text(results, height=8, wrap="word", state="disabled", background="#f7f9fb", relief="flat", font=("TkDefaultFont", 12))
+        self.results_text = tk.Text(results, height=8, wrap="word", state="disabled", background="#f7f9fb", relief="flat")
         self.results_text.pack(fill="both", expand=True)
 
         log_toolbar = ttk.Frame(log_frame)
@@ -214,7 +242,7 @@ class FreeTune4DApp(tk.Tk):
         self.log_text = tk.Text(
             log_frame, height=12, wrap="none", state="disabled",
             background="#101820", foreground="#dce5ec", insertbackground="white",
-            selectbackground="#35566f", font=("TkFixedFont", 12), undo=False,
+            selectbackground="#35566f", font="TkFixedFont", undo=False,
         )
         log_scroll_y = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
         log_scroll_x = ttk.Scrollbar(log_frame, orient="horizontal", command=self.log_text.xview)
@@ -233,19 +261,26 @@ class FreeTune4DApp(tk.Tk):
         self._update_controls()
 
     def _path_row(self, parent, row, label, description, variable, browse_command):
-        ttk.Label(parent, text=label, style="StatusName.TLabel").grid(row=row, column=0, columnspan=2, sticky="w", pady=(8 if row else 0, 2))
+        label_widget = ttk.Label(parent, text=label, style="StatusName.TLabel")
+        label_widget.grid(row=row, column=0, columnspan=2, sticky="w", pady=(8 if row else 0, 2))
         ttk.Label(parent, text=description, foreground="#657786", wraplength=590).grid(row=row + 1, column=0, columnspan=2, sticky="w", pady=(0, 5))
         entry = ttk.Entry(parent, textvariable=variable)
         entry.grid(row=row + 2, column=0, sticky="ew", padx=(0, 9), pady=(0, 5))
-        button = ttk.Button(parent, text="Browse...", width=11, command=browse_command)
+        button = ttk.Button(parent, text="Browse...", width=10, command=browse_command)
         button.grid(row=row + 2, column=1, sticky="e", pady=(0, 5))
+        if label.startswith("Dynamic"):
+            self.dynamic_label = label_widget
+        elif label.startswith("Static"):
+            self.static_label = label_widget
+        elif label == "Output Directory":
+            self.output_label = label_widget
         return entry, button
 
     def _file_row(self, parent, row, label, variable, command):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=7)
         entry = ttk.Entry(parent, textvariable=variable)
         entry.grid(row=row, column=1, sticky="ew", padx=8, pady=7)
-        button = ttk.Button(parent, text="Browse...", width=11, command=command)
+        button = ttk.Button(parent, text="Browse...", width=10, command=command)
         button.grid(row=row, column=2, pady=7)
         if not hasattr(self, "advanced_controls"):
             self.advanced_controls = []
@@ -511,7 +546,7 @@ class FreeTune4DApp(tk.Tk):
         dialog.resizable(True, False)
         body = ttk.Frame(dialog, padding=18)
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text=f"{label} failed", font=("TkDefaultFont", 16, "bold"), foreground="#a32929").pack(anchor="w")
+        ttk.Label(body, text=f"{label} failed", style="Section.TLabel", foreground="#a32929").pack(anchor="w")
         ttk.Label(body, text=concise, wraplength=600).pack(anchor="w", fill="x", pady=(10, 4))
         ttk.Label(body, text="Detailed traceback is available in Runtime Log.", foreground="#526577").pack(anchor="w")
         actions = ttk.Frame(body)
@@ -542,6 +577,76 @@ class FreeTune4DApp(tk.Tk):
             subprocess.Popen(["open", str(path)])
         else:
             subprocess.Popen(["xdg-open", str(path)])
+
+    def _effective_font(self, widget: tk.Misc, labelframe_title: bool = False) -> tkfont.Font:
+        """Return the font Tk actually resolves for a widget after styling."""
+        font_spec = ""
+        if not labelframe_title:
+            try:
+                font_spec = str(widget.cget("font"))
+            except tk.TclError:
+                pass
+        if not font_spec and isinstance(widget, ttk.Widget):
+            style = ttk.Style(self)
+            style_name = str(widget.cget("style")) or widget.winfo_class()
+            if labelframe_title:
+                style_name += ".Label" if style_name != "TLabelframe" else ".Label"
+            font_spec = str(style.lookup(style_name, "font"))
+        return tkfont.Font(root=self, font=font_spec or "TkDefaultFont")
+
+    def _print_ui_diagnostics(self) -> None:
+        """Print effective post-layout typography when FREETUNE4D_DEBUG_UI=1."""
+        self.update_idletasks()
+        logical_dpi = float(self.winfo_fpixels("1i"))
+        scaling = float(self.tk.call("tk", "scaling"))
+        print("[FONT DEBUG]")
+        print(
+            f"Screen: logicalDPI={logical_dpi:.2f}, tkScaling={scaling:.4f}, "
+            f"devicePixelRatio=not exposed by Tk, size={self.winfo_screenwidth()}x{self.winfo_screenheight()}"
+        )
+        for variable in (
+            "QT_SCALE_FACTOR", "QT_FONT_DPI", "QT_AUTO_SCREEN_SCALE_FACTOR",
+            "QT_ENABLE_HIGHDPI_SCALING",
+        ):
+            print(f"Environment: {variable}={os.environ.get(variable, '<unset>')}")
+
+        widgets = (
+            ("Application default", self, False),
+            ("Main window", self, False),
+            ("centralWidget", self.central_widget, False),
+            ("Input Data title", self.input_frame, True),
+            ("Dynamic LQ label", self.dynamic_label, False),
+            ("Static UQ label", self.static_label, False),
+            ("MRI Modality label", self.modality_label, False),
+            ("Path entry", self.dynamic_entry, False),
+            ("Browse button", self.dynamic_browse, False),
+            ("Advanced Settings", self.advanced_toggle, False),
+            ("Workflow title", self.workflow_frame, True),
+            ("Workflow Input", self.workflow_name_labels[0], False),
+            ("Workflow status", self.workflow_status_labels[0], False),
+            ("Preprocessing button", self.preprocess_button, False),
+            ("Motion Reconstruction button", self.reconstruct_button, False),
+            ("Current Operation title", self.operation_frame, True),
+            ("Output Summary title", self.results_frame, True),
+            ("Runtime Log title", self.log_frame, True),
+            ("Runtime Log text", self.log_text, False),
+        )
+        for label, widget, title_font in widgets:
+            font = self._effective_font(widget, title_font)
+            actual = font.actual()
+            pixel_size = abs(int(actual["size"])) if int(actual["size"]) < 0 else font.metrics("linespace")
+            point_size = pixel_size * 72.0 / logical_dpi
+            text_value = ""
+            try:
+                text_value = str(widget.cget("text"))
+            except tk.TclError:
+                pass
+            print(
+                f"{label}: class={widget.winfo_class()}, objectName={widget.winfo_name()}, "
+                f"text={text_value!r}, family={actual['family']!r}, requestedSize={actual['size']}, "
+                f"effectivePx={pixel_size}, equivalentPt={point_size:.2f}, "
+                f"height={widget.winfo_height()}, minimumHeight={widget.winfo_reqheight()}"
+            )
 
     def _on_close(self) -> None:
         if self.controller.busy:

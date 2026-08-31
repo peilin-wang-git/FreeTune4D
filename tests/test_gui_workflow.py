@@ -5,6 +5,7 @@ import unittest
 from freetune4d_gui.backend import BackendError, FreeTune4DBackend, PipelineConfig
 from freetune4d_gui.app import FreeTune4DApp
 from freetune4d_gui.controller import WorkflowController, WorkflowState
+from freetune4d_gui.typography import TYPOGRAPHY
 
 
 class SimulatedBackend(FreeTune4DBackend):
@@ -176,10 +177,12 @@ class GuiLayoutContractTests(unittest.TestCase):
         self.assertEqual((65, 35), FreeTune4DApp.COLUMN_WEIGHTS)
         self.assertGreaterEqual(FreeTune4DApp.MINIMUM_SIZE[0], 1100)
         self.assertGreaterEqual(FreeTune4DApp.MINIMUM_SIZE[1], 720)
-        self.assertGreaterEqual(FreeTune4DApp.FONT_SIZES["title"], 22)
-        self.assertGreaterEqual(FreeTune4DApp.FONT_SIZES["section"], 16)
-        self.assertGreaterEqual(FreeTune4DApp.FONT_SIZES["normal"], 13)
-        self.assertGreaterEqual(FreeTune4DApp.FONT_SIZES["log"], 12)
+        self.assertEqual(24, FreeTune4DApp.FONT_SIZES["title"])
+        self.assertEqual(20, FreeTune4DApp.FONT_SIZES["section"])
+        self.assertEqual(17, FreeTune4DApp.FONT_SIZES["normal"])
+        self.assertEqual(15, FreeTune4DApp.FONT_SIZES["log"])
+        self.assertGreaterEqual(TYPOGRAPHY.CONTROL_HEIGHT_PX, 36)
+        self.assertGreaterEqual(TYPOGRAPHY.PRIMARY_HEIGHT_PX, 44)
 
 
 if __name__ == "__main__":
