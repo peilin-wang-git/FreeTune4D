@@ -14,6 +14,7 @@ import sys
 import threading
 import traceback
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
 
 from .backend import BackendError, FreeTune4DBackend, OutputSummary, PipelineConfig
@@ -25,7 +26,9 @@ class FreeTune4DApp(tk.Tk):
     WINDOW_SIZE = (1280, 840)
     MINIMUM_SIZE = (1100, 720)
     COLUMN_WEIGHTS = (65, 35)
-    FONT_SIZES = {"title": 24, "section": 16, "normal": 13, "button": 14, "status": 13, "log": 12}
+    # Tk uses points for positive font sizes.  Keep these values centralized so
+    # every normal control inherits the same DPI-aware application font.
+    FONT_SIZES = {"title": 20, "section": 14, "normal": 12, "log": 11}
 
     def __init__(self, backend: FreeTune4DBackend | None = None):
         super().__init__()
@@ -77,27 +80,43 @@ class FreeTune4DApp(tk.Tk):
             variable.trace_add("write", self._on_config_changed)
 
     def _configure_style(self) -> None:
-        # Use explicit, moderate fonts instead of an oversized global Tk scale.
         fonts = self.FONT_SIZES
-        self.option_add("*Font", ("TkDefaultFont", fonts["normal"]))
-        self.option_add("*Text.Font", ("TkFixedFont", fonts["log"]))
+
+        # Configure Tk's named application fonts rather than constructing tuples
+        # whose first item (for example, "TkDefaultFont") is interpreted as a
+        # literal font-family name.  Named fonts propagate to existing and future
+        # child widgets and retain Tk's normal DPI-aware point-to-pixel scaling.
+        default_font = tkfont.nametofont("TkDefaultFont")
+        default_font.configure(size=fonts["normal"])
+        for name in ("TkTextFont", "TkMenuFont", "TkCaptionFont", "TkSmallCaptionFont"):
+            tkfont.nametofont(name).configure(
+                family=default_font.actual("family"), size=fonts["normal"]
+            )
+        tkfont.nametofont("TkHeadingFont").configure(
+            family=default_font.actual("family"), size=fonts["section"], weight="bold"
+        )
+        tkfont.nametofont("TkFixedFont").configure(size=fonts["log"])
+
+        self.option_add("*Font", "TkDefaultFont")
+        self.option_add("*Text.Font", "TkTextFont")
         style = ttk.Style(self)
         if "clam" in style.theme_names():
             style.theme_use("clam")
-        style.configure("TLabel", font=("TkDefaultFont", 13))
-        style.configure("TEntry", font=("TkDefaultFont", 13), padding=(8, 7))
-        style.configure("TCombobox", font=("TkDefaultFont", 13), padding=(8, 6))
-        style.configure("TSpinbox", font=("TkDefaultFont", 13), padding=(8, 6))
-        style.configure("TButton", font=("TkDefaultFont", 13), padding=(12, 7))
-        style.configure("Header.TLabel", font=("TkDefaultFont", fonts["title"], "bold"), foreground="#17324d")
-        style.configure("Subheader.TLabel", font=("TkDefaultFont", 14), foreground="#526577")
-        style.configure("Section.TLabelframe.Label", font=("TkDefaultFont", fonts["section"], "bold"), foreground="#17324d")
+        style.configure("TLabel", font="TkDefaultFont")
+        style.configure("TEntry", font="TkDefaultFont", padding=(8, 7))
+        style.configure("TCombobox", font="TkDefaultFont", padding=(8, 7))
+        style.configure("TSpinbox", font="TkDefaultFont", padding=(8, 7))
+        style.configure("TButton", font="TkDefaultFont", padding=(12, 7))
+        style.configure("Header.TLabel", font=(default_font.actual("family"), fonts["title"], "bold"), foreground="#17324d")
+        style.configure("Subheader.TLabel", font="TkDefaultFont", foreground="#526577")
+        style.configure("Section.TLabel", font="TkHeadingFont", foreground="#17324d")
+        style.configure("Section.TLabelframe.Label", font="TkHeadingFont", foreground="#17324d")
         style.configure("Section.TLabelframe", borderwidth=1, relief="solid")
-        style.configure("Primary.TButton", font=("TkDefaultFont", 14, "bold"), padding=(16, 11))
-        style.configure("StatusName.TLabel", font=("TkDefaultFont", 13, "bold"))
-        style.configure("Status.TLabel", font=("TkDefaultFont", 13, "bold"), padding=(9, 6), background="#edf2f6")
-        style.configure("Operation.TLabel", font=("TkDefaultFont", 14, "bold"), foreground="#17324d")
-        style.configure("Link.TButton", font=("TkDefaultFont", 12), padding=(10, 6))
+        style.configure("Primary.TButton", font=(default_font.actual("family"), fonts["normal"], "bold"), padding=(16, 11))
+        style.configure("StatusName.TLabel", font=(default_font.actual("family"), fonts["normal"], "bold"))
+        style.configure("Status.TLabel", font="TkDefaultFont", padding=(9, 6), background="#edf2f6")
+        style.configure("Operation.TLabel", font=(default_font.actual("family"), fonts["normal"], "bold"), foreground="#17324d")
+        style.configure("Link.TButton", font="TkDefaultFont", padding=(10, 7))
 
     def _build_ui(self) -> None:
         outer = ttk.Frame(self, padding=(20, 16))
@@ -183,7 +202,7 @@ class FreeTune4DApp(tk.Tk):
             ("3", "Motion Reconstruction", self.reconstruct_status_var),
             ("4", "Output", self.output_status_var),
         )):
-            ttk.Label(status_grid, text=number, font=("TkDefaultFont", 15, "bold"), width=3).grid(row=row, column=0, sticky="nw", pady=8)
+            ttk.Label(status_grid, text=number, style="StatusName.TLabel", width=3).grid(row=row, column=0, sticky="nw", pady=8)
             item = ttk.Frame(status_grid)
             item.grid(row=row, column=1, sticky="ew", pady=8)
             ttk.Label(item, text=title, style="StatusName.TLabel").pack(anchor="w")
@@ -203,7 +222,7 @@ class FreeTune4DApp(tk.Tk):
 
         results = ttk.Labelframe(workflow, text="Output Summary", padding=12, style="Section.TLabelframe")
         results.pack(fill="both", expand=True)
-        self.results_text = tk.Text(results, height=8, wrap="word", state="disabled", background="#f7f9fb", relief="flat", font=("TkDefaultFont", 12))
+        self.results_text = tk.Text(results, height=8, wrap="word", state="disabled", background="#f7f9fb", relief="flat")
         self.results_text.pack(fill="both", expand=True)
 
         log_toolbar = ttk.Frame(log_frame)
@@ -214,7 +233,7 @@ class FreeTune4DApp(tk.Tk):
         self.log_text = tk.Text(
             log_frame, height=12, wrap="none", state="disabled",
             background="#101820", foreground="#dce5ec", insertbackground="white",
-            selectbackground="#35566f", font=("TkFixedFont", 12), undo=False,
+            selectbackground="#35566f", font="TkFixedFont", undo=False,
         )
         log_scroll_y = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
         log_scroll_x = ttk.Scrollbar(log_frame, orient="horizontal", command=self.log_text.xview)
@@ -237,7 +256,7 @@ class FreeTune4DApp(tk.Tk):
         ttk.Label(parent, text=description, foreground="#657786", wraplength=590).grid(row=row + 1, column=0, columnspan=2, sticky="w", pady=(0, 5))
         entry = ttk.Entry(parent, textvariable=variable)
         entry.grid(row=row + 2, column=0, sticky="ew", padx=(0, 9), pady=(0, 5))
-        button = ttk.Button(parent, text="Browse...", width=11, command=browse_command)
+        button = ttk.Button(parent, text="Browse...", width=10, command=browse_command)
         button.grid(row=row + 2, column=1, sticky="e", pady=(0, 5))
         return entry, button
 
@@ -245,7 +264,7 @@ class FreeTune4DApp(tk.Tk):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=7)
         entry = ttk.Entry(parent, textvariable=variable)
         entry.grid(row=row, column=1, sticky="ew", padx=8, pady=7)
-        button = ttk.Button(parent, text="Browse...", width=11, command=command)
+        button = ttk.Button(parent, text="Browse...", width=10, command=command)
         button.grid(row=row, column=2, pady=7)
         if not hasattr(self, "advanced_controls"):
             self.advanced_controls = []
@@ -511,7 +530,7 @@ class FreeTune4DApp(tk.Tk):
         dialog.resizable(True, False)
         body = ttk.Frame(dialog, padding=18)
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text=f"{label} failed", font=("TkDefaultFont", 16, "bold"), foreground="#a32929").pack(anchor="w")
+        ttk.Label(body, text=f"{label} failed", style="Section.TLabel", foreground="#a32929").pack(anchor="w")
         ttk.Label(body, text=concise, wraplength=600).pack(anchor="w", fill="x", pady=(10, 4))
         ttk.Label(body, text="Detailed traceback is available in Runtime Log.", foreground="#526577").pack(anchor="w")
         actions = ttk.Frame(body)
