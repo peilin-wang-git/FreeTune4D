@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from collections import deque
 from hashlib import sha256
 import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import threading
 from typing import Callable
 
 
@@ -18,7 +21,41 @@ LogCallback = Callable[[str], None]
 
 
 class BackendError(RuntimeError):
-    """An actionable pipeline orchestration or output-validation failure."""
+    """Structured, actionable pipeline or subprocess failure."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: str = "backend",
+        operation: str | None = None,
+        command: tuple[str, ...] = (),
+        exit_code: int | None = None,
+        stdout_tail: str = "",
+        stderr_tail: str = "",
+        root_message: str | None = None,
+    ):
+        super().__init__(message)
+        self.kind = kind
+        self.operation = operation
+        self.command = command
+        self.exit_code = exit_code
+        self.stdout_tail = stdout_tail
+        self.stderr_tail = stderr_tail
+        self.root_message = root_message or message
+
+    @property
+    def details(self) -> str:
+        parts = [f"Operation: {self.operation or 'unknown'}", f"Category: {self.kind}"]
+        if self.exit_code is not None:
+            parts.append(f"Exit code: {self.exit_code}")
+        if self.command:
+            parts.append("Command: " + shlex.join(self.command))
+        if self.stdout_tail:
+            parts.extend(("", "--- stdout tail ---", self.stdout_tail))
+        if self.stderr_tail:
+            parts.extend(("", "--- stderr tail ---", self.stderr_tail))
+        return "\n".join(parts)
 
 
 @dataclass(frozen=True)
@@ -31,6 +68,7 @@ class PipelineConfig:
     fine_model: Path = Path("models/fine.h5")
     reference_dicom: Path | None = None
     phase_count: int = 5
+    cuda_diagnostics: bool = False
 
     def normalized(self) -> "PipelineConfig":
         reference = self.reference_dicom.expanduser().resolve() if self.reference_dicom else None
@@ -43,10 +81,12 @@ class PipelineConfig:
             fine_model=self.fine_model.expanduser().resolve(),
             reference_dicom=reference,
             phase_count=self.phase_count,
+            cuda_diagnostics=self.cuda_diagnostics,
         )
 
     def signature(self) -> str:
         values = asdict(self.normalized())
+        values.pop("cuda_diagnostics", None)
         serializable = {key: str(value) for key, value in values.items()}
         return sha256(json.dumps(serializable, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -126,8 +166,8 @@ class FreeTune4DBackend:
             errors.append(f"{label} DICOM directory does not exist: {directory}")
         elif not self._dicom_candidates(directory):
             errors.append(f"No DICOM files were found in the {label} directory.")
-        elif not any(path.name.startswith("IM-") for path in directory.iterdir() if path.is_file()):
-            errors.append(f"The current backend requires {label} files named IM-*.")
+        elif not any(path.name.startswith("IM-") and path.suffix.lower() == ".dcm" for path in directory.iterdir() if path.is_file()):
+            errors.append(f"The current backend requires {label} files named IM-*.dcm.")
 
     def output_paths(self, config: PipelineConfig) -> tuple[Path, Path, Path]:
         root = config.normalized().output_root
@@ -145,7 +185,7 @@ class FreeTune4DBackend:
         config = config.normalized()
         errors = self.validate_inputs(config)
         if errors:
-            raise BackendError("\n".join(errors))
+            raise BackendError("\n".join(errors), kind="invalid_input", operation="preprocessing")
         preprocessing, _, qc = self.output_paths(config)
         preprocessing.mkdir(parents=True, exist_ok=True)
         qc.mkdir(parents=True, exist_ok=True)
@@ -159,10 +199,18 @@ class FreeTune4DBackend:
             "--MR_number", "case",
             "--st_date", "session",
         ]
-        self._run(command, self.repo_root, log)
+        env = os.environ.copy()
+        if config.cuda_diagnostics:
+            env["CUDA_LAUNCH_BLOCKING"] = "1"
+            log("CUDA diagnostic mode enabled for this run: CUDA_LAUNCH_BLOCKING=1")
+        self._run("preprocessing", command, self.repo_root, log, env)
         phase_file = patient_dir / "phase_T2.mat"
         if not phase_file.is_file() or phase_file.stat().st_size == 0:
-            raise BackendError("Preprocessing process exited successfully, but phase_T2.mat was not generated.")
+            raise BackendError(
+                "Preprocessing process exited successfully, but phase_T2.mat was not generated.",
+                kind="output_validation",
+                operation="preprocessing",
+            )
         shutil.copy2(phase_file, preprocessing / phase_file.name)
         full_data = patient_dir / "Full_data.mat"
         if full_data.is_file():
@@ -186,14 +234,14 @@ class FreeTune4DBackend:
     def run_motion_reconstruction(self, config: PipelineConfig, log: LogCallback = print) -> OutputSummary:
         config = config.normalized()
         if not self.validate_preprocessing_output(config):
-            raise BackendError("Validated preprocessing output for the current case was not found.")
+            raise BackendError("Validated preprocessing output for the current case was not found.", kind="invalid_input", operation="motion reconstruction")
         preprocessing, reconstructed, qc = self.output_paths(config)
         patient_dir = preprocessing / "_backend_case" / "case" / "session"
         backend_base = preprocessing / "_backend_case"
         static_link = patient_dir / "T2_AX_MVXD"
         reference = config.reference_dicom or self._select_reference_dicom(config.static_dicom_dir)
         if not reference:
-            raise BackendError("A reference DICOM could not be selected from the static MRI directory.")
+            raise BackendError("A reference DICOM could not be selected from the static MRI directory.", kind="invalid_input", operation="motion reconstruction")
         runtime_dir = preprocessing / "_runtime"
         runtime_dir.mkdir(parents=True, exist_ok=True)
         self._prepare_runtime(runtime_dir)
@@ -211,10 +259,17 @@ class FreeTune4DBackend:
         env = os.environ.copy()
         pytorch_path = self.repo_root / "voxelmorph-master" / "pytorch"
         env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(pytorch_path), str(self.repo_root), env.get("PYTHONPATH", "")]))
-        self._run(command, runtime_dir, log, env)
+        if config.cuda_diagnostics:
+            env["CUDA_LAUNCH_BLOCKING"] = "1"
+            log("CUDA diagnostic mode enabled for this run: CUDA_LAUNCH_BLOCKING=1")
+        self._run("motion reconstruction", command, runtime_dir, log, env)
         backend_output = patient_dir / "UQ_4D_T2"
         if not backend_output.is_dir():
-            raise BackendError("Reconstruction process exited successfully, but UQ_4D_T2 was not generated.")
+            raise BackendError(
+                "Reconstruction process exited successfully, but UQ_4D_T2 was not generated.",
+                kind="output_validation",
+                operation="motion reconstruction",
+            )
         reconstructed.mkdir(parents=True, exist_ok=True)
         self._copy_tree_contents(backend_output, reconstructed)
         self._copy_qc(runtime_dir / "tmp_plot", qc / "reconstruction")
@@ -294,22 +349,84 @@ class FreeTune4DBackend:
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     @staticmethod
-    def _run(command: list[str], cwd: Path, log: LogCallback, env: dict[str, str] | None = None) -> None:
-        log("Executing backend: " + " ".join(command))
-        process = subprocess.Popen(
-            command,
-            cwd=cwd,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-        )
-        assert process.stdout is not None
-        for line in process.stdout:
-            log(line.rstrip())
+    def _classify_failure(text: str) -> tuple[str, str]:
+        lowered = text.lower()
+        meaningful = [line.strip() for line in text.splitlines() if line.strip()]
+        python_exceptions = [
+            line for line in meaningful
+            if re.match(r"^(?:[\w.]+(?:Error|Exception)|AssertionError):", line)
+        ]
+        exception_lines = [line for line in meaningful if re.search(r"(?:error|exception|assert triggered|failed)", line, re.IGNORECASE)]
+        root = python_exceptions[-1] if python_exceptions else (exception_lines[-1] if exception_lines else (meaningful[-1] if meaningful else "Backend process failed without diagnostic output."))
+        if "cuda" in lowered or "cudnn" in lowered or "device-side assert" in lowered:
+            return "cuda", root
+        if any(token in lowered for token in ("load_weights", "model_weights", ".h5", "weight file")):
+            return "model_loading", root
+        if any(token in lowered for token in ("modulenotfounderror", "no module named", "command not found", "filenotfounderror")):
+            return "missing_dependency", root
+        if any(token in lowered for token in ("dicom", "invalid input", "shape mismatch", "no valid axial overlap")):
+            return "invalid_input", root
+        return "backend", root
+
+    @staticmethod
+    def _run(operation: str, command: list[str], cwd: Path, log: LogCallback, env: dict[str, str] | None = None) -> None:
+        rendered_command = shlex.join(command)
+        log(f"Backend operation: {operation}")
+        log(f"Working directory: {cwd}")
+        log(f"Python executable: {command[0]}")
+        log(f"Exact command: {rendered_command}")
+        log(f"CUDA_VISIBLE_DEVICES: {(env or os.environ).get('CUDA_VISIBLE_DEVICES', '<not set>')}")
+        log(f"CUDA_LAUNCH_BLOCKING: {(env or os.environ).get('CUDA_LAUNCH_BLOCKING', '<not set>')}")
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+        except OSError as exc:
+            raise BackendError(
+                f"Unable to start {operation}: {exc}",
+                kind="missing_dependency",
+                operation=operation,
+                command=tuple(command),
+                root_message=str(exc),
+            ) from exc
+
+        stdout_tail: deque[str] = deque(maxlen=120)
+        stderr_tail: deque[str] = deque(maxlen=120)
+
+        def read_stream(stream, prefix: str, target: deque[str]) -> None:
+            for line in iter(stream.readline, ""):
+                clean = line.rstrip("\r\n")
+                target.append(clean)
+                log(f"{prefix}{clean}")
+            stream.close()
+
+        assert process.stdout is not None and process.stderr is not None
+        stdout_thread = threading.Thread(target=read_stream, args=(process.stdout, "[stdout] ", stdout_tail), daemon=True)
+        stderr_thread = threading.Thread(target=read_stream, args=(process.stderr, "[stderr] ", stderr_tail), daemon=True)
+        stdout_thread.start()
+        stderr_thread.start()
         return_code = process.wait()
+        stdout_thread.join()
+        stderr_thread.join()
         if return_code:
-            raise BackendError(f"Backend process failed with exit code {return_code}.")
+            stdout_text = "\n".join(stdout_tail)
+            stderr_text = "\n".join(stderr_tail)
+            kind, root_message = FreeTune4DBackend._classify_failure("\n".join((stdout_text, stderr_text)))
+            raise BackendError(
+                f"{operation.capitalize()} failed: {root_message}",
+                kind=kind,
+                operation=operation,
+                command=tuple(command),
+                exit_code=return_code,
+                stdout_tail=stdout_text,
+                stderr_tail=stderr_text,
+                root_message=root_message,
+            )
