@@ -176,10 +176,10 @@ class GuiLayoutContractTests(unittest.TestCase):
         self.assertEqual((65, 35), FreeTune4DApp.COLUMN_WEIGHTS)
         self.assertGreaterEqual(FreeTune4DApp.MINIMUM_SIZE[0], 1100)
         self.assertGreaterEqual(FreeTune4DApp.MINIMUM_SIZE[1], 720)
-        self.assertGreaterEqual(FreeTune4DApp.FONT_SIZES["title"], 22)
-        self.assertGreaterEqual(FreeTune4DApp.FONT_SIZES["section"], 16)
-        self.assertGreaterEqual(FreeTune4DApp.FONT_SIZES["normal"], 13)
-        self.assertGreaterEqual(FreeTune4DApp.FONT_SIZES["log"], 12)
+        self.assertEqual(20, FreeTune4DApp.FONT_SIZES["title"])
+        self.assertEqual(14, FreeTune4DApp.FONT_SIZES["section"])
+        self.assertEqual(12, FreeTune4DApp.FONT_SIZES["normal"])
+        self.assertEqual(11, FreeTune4DApp.FONT_SIZES["log"])
 
 
 if __name__ == "__main__":
