@@ -19,6 +19,8 @@ from tkinter import filedialog, messagebox, ttk
 
 from .backend import BackendError, FreeTune4DBackend, OutputSummary, PipelineConfig
 from .controller import WorkflowController, WorkflowState
+from .devices import DeviceInfo
+from .dialogs import choose_directory
 from .typography import TYPOGRAPHY, configure_named_fonts
 
 
@@ -43,6 +45,8 @@ class FreeTune4DApp(tk.Tk):
         self.last_validation_errors: list[str] = []
         self.output_summary: OutputSummary | None = None
         self.last_error_details = ""
+        self.active_device: DeviceInfo | None = None
+        self.last_directory = Path.home()
 
         self.title("FreeTune4D — UQ 4D-MRI Motion Reconstruction")
         self.geometry(f"{self.WINDOW_SIZE[0]}x{self.WINDOW_SIZE[1]}")
@@ -67,6 +71,7 @@ class FreeTune4DApp(tk.Tk):
         self.reference_var = tk.StringVar()
         self.phase_var = tk.StringVar(value="5")
         self.cuda_diagnostics_var = tk.BooleanVar(value=False)
+        self.compute_device_var = tk.StringVar(value="Auto (recommended)")
         self.overall_status_var = tk.StringVar(value="Select valid inputs to begin.")
         self.input_status_var = tk.StringVar(value="Waiting")
         self.preprocess_status_var = tk.StringVar(value="Waiting")
@@ -82,6 +87,7 @@ class FreeTune4DApp(tk.Tk):
             self.reference_var,
             self.phase_var,
             self.cuda_diagnostics_var,
+            self.compute_device_var,
         ):
             variable.trace_add("write", self._on_config_changed)
 
@@ -161,6 +167,23 @@ class FreeTune4DApp(tk.Tk):
         self.modality_combo.grid(row=7, column=0, sticky="w", pady=(0, 5))
         self.modality_note = ttk.Label(input_frame, text="T2 backend available; T1 backend is not present.", foreground="#7a5a00")
         self.modality_note.grid(row=8, column=0, columnspan=2, sticky="w")
+
+        ttk.Label(input_frame, text="Compute Device", style="StatusName.TLabel").grid(
+            row=9, column=0, columnspan=2, sticky="w", pady=(10, 4)
+        )
+        device_row = ttk.Frame(input_frame)
+        device_row.grid(row=10, column=0, columnspan=2, sticky="ew")
+        device_row.columnconfigure(0, weight=1)
+        self.compute_device_combo = ttk.Combobox(
+            device_row, textvariable=self.compute_device_var, state="readonly"
+        )
+        self.compute_device_combo.grid(row=0, column=0, sticky="ew", padx=(0, 9))
+        self.refresh_devices_button = ttk.Button(device_row, text="Refresh", command=self._refresh_device_list)
+        self.refresh_devices_button.grid(row=0, column=1)
+        self.device_status = ttk.Label(input_frame, foreground="#526577", wraplength=590)
+        self.device_status.grid(row=11, column=0, columnspan=2, sticky="w", pady=(5, 0))
+        self.device_display_to_key: dict[str, str] = {}
+        self._refresh_device_list(log_devices=False)
 
         output_frame = ttk.Labelframe(left, text="Output", padding=14, style="Section.TLabelframe")
         output_frame.pack(fill="x", pady=(0, 14))
@@ -297,9 +320,11 @@ class FreeTune4DApp(tk.Tk):
             self.advanced_toggle.configure(text="Advanced Settings ▾")
 
     def _browse_directory(self, variable: tk.StringVar) -> None:
-        selected = filedialog.askdirectory(initialdir=variable.get() or str(Path.home()))
+        initial = Path(variable.get()) if variable.get().strip() else self.last_directory
+        selected = choose_directory(self, initial)
         if selected:
-            variable.set(selected)
+            self.last_directory = selected
+            variable.set(str(selected))
 
     def _browse_file(self, variable: tk.StringVar, filetypes) -> None:
         selected = filedialog.askopenfilename(initialdir=str(Path(variable.get()).parent) if variable.get() else str(Path.home()), filetypes=filetypes)
@@ -323,7 +348,48 @@ class FreeTune4DApp(tk.Tk):
             reference,
             phase_count,
             self.cuda_diagnostics_var.get(),
+            self.device_display_to_key.get(self.compute_device_var.get(), "auto"),
         )
+
+    def _refresh_device_list(self, log_devices: bool = True) -> None:
+        previous_key = self.device_display_to_key.get(self.compute_device_var.get(), "auto") if hasattr(self, "device_display_to_key") else "auto"
+        devices = self.backend.refresh_devices()
+        choices = ["Auto (recommended)"]
+        mapping = {"Auto (recommended)": "auto"}
+        for device in devices:
+            choices.append(device.display_name)
+            mapping[device.display_name] = device.key
+        self.device_display_to_key = mapping
+        selected_display = next((display for display, key in mapping.items() if key == previous_key), "Auto (recommended)")
+        self.compute_device_combo.configure(values=choices)
+        self.compute_device_var.set(selected_display)
+        selected = self.backend.resolve_device(self._config())
+        if selected:
+            suffix = " — Low available VRAM" if selected.low_memory else ""
+            prefix = "Auto will use " if self._config().compute_device == "auto" else "Selected "
+            self.device_status.configure(text=f"{prefix}GPU {selected.physical_index}: {selected.free_gib:.2f}/{selected.total_gib:.2f} GiB free{suffix}")
+        else:
+            self.device_status.configure(text="No compatible CUDA GPU detected. CPU is unavailable in the current backend.")
+        if log_devices and hasattr(self, "log_text"):
+            self._log(f"[DEVICE] Refreshed CUDA devices: {len(devices)} detected")
+
+    def _preflight_device(self, config: PipelineConfig, operation: str) -> bool:
+        self._refresh_device_list(log_devices=False)
+        config = self._config().normalized()
+        device = self.backend.resolve_device(config)
+        if device is None:
+            messagebox.showerror("Compute device unavailable", self.backend.device_error(config))
+            return False
+        self.active_device = device
+        self._log(f"[DEVICE] Pre-flight for {operation}: {device.display_name}")
+        if device.low_memory:
+            return messagebox.askyesno(
+                "Low GPU memory",
+                f"GPU {device.physical_index} currently has only {device.free_gib:.2f} GiB free "
+                f"out of {device.total_gib:.2f} GiB.\n\n{operation.title()} may fail with CUDA out-of-memory. "
+                "Choose another GPU or free GPU memory.\n\nContinue anyway?",
+            )
+        return True
 
     def _on_config_changed(self, *_args) -> None:
         if hasattr(self, "preprocess_button") and not self.controller.busy:
@@ -332,6 +398,9 @@ class FreeTune4DApp(tk.Tk):
     def _validate_form(self, log_success: bool = True) -> bool:
         config = self._config()
         errors = self.backend.validate_inputs(config)
+        device_error = self.backend.device_error(config)
+        if device_error:
+            errors.append(device_error)
         previous_signature = self.controller.config_signature
         self.controller.inputs_validated(config, errors)
         if previous_signature and previous_signature != self.controller.config_signature:
@@ -352,6 +421,9 @@ class FreeTune4DApp(tk.Tk):
             messagebox.showerror("Invalid configuration", "\n".join(self.last_validation_errors))
             return
         config = self._config().normalized()
+        if not self._preflight_device(config, "preprocessing"):
+            return
+        config = self._config().normalized()
         if self.backend.has_existing_outputs(config):
             replace = messagebox.askyesno("Existing output detected", "Managed output folders contain data. Re-run and replace these outputs?\n\nNo data will be deleted unless you choose Yes.")
             if not replace:
@@ -369,6 +441,9 @@ class FreeTune4DApp(tk.Tk):
             messagebox.showerror("Preprocessing required", "Successful preprocessing for the current case is required.")
             self._validate_form(log_success=False)
             return
+        if not self._preflight_device(config, "motion reconstruction"):
+            return
+        config = self._config().normalized()
         reconstructed = self.backend.output_paths(config)[1]
         if reconstructed.exists() and any(reconstructed.iterdir()):
             if not messagebox.askyesno("Existing reconstruction", "Reconstructed output already exists. Replace it and continue?"):
@@ -463,6 +538,8 @@ class FreeTune4DApp(tk.Tk):
         for button in (self.dynamic_browse, self.static_browse, self.output_browse):
             button.configure(state=editable_state)
         self.modality_combo.configure(state="disabled" if busy else "readonly")
+        self.compute_device_combo.configure(state="disabled" if busy else "readonly")
+        self.refresh_devices_button.configure(state="disabled" if busy else "normal")
         self.phase_spin.configure(state=editable_state)
         for control in getattr(self, "advanced_controls", []):
             control.configure(state=editable_state)
@@ -513,6 +590,7 @@ class FreeTune4DApp(tk.Tk):
         self._log(f"Output root: {config.output_root}")
         self._log(f"Respiratory phases: {config.phase_count}")
         self._log(f"CUDA diagnostic mode: {'enabled' if config.cuda_diagnostics else 'disabled'}")
+        self._log(f"Compute device mode: {config.compute_device}")
 
     def _log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -523,8 +601,19 @@ class FreeTune4DApp(tk.Tk):
             self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
-    @staticmethod
-    def _backend_error_message(error: BackendError) -> str:
+    def _backend_error_message(self, error: BackendError) -> str:
+        if error.kind == "cuda_oom":
+            device = self.active_device
+            selected = device.display_name if device else "the selected GPU"
+            memory = (
+                f"\nTotal GPU memory: {device.total_gib:.2f} GiB"
+                f"\nFree memory before launch: approximately {device.free_gib:.2f} GiB"
+                if device else ""
+            )
+            return (
+                f"GPU memory exhausted during {error.operation}.\nSelected device: {selected}{memory}\n\n"
+                "Try selecting another GPU, closing other GPU workloads, or retrying after GPU memory becomes available."
+            )
         if error.kind == "cuda":
             if "device-side assert" in (error.root_message + error.stderr_tail).lower():
                 return f"CUDA device-side assertion detected. {error.root_message}"
