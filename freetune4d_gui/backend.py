@@ -16,6 +16,8 @@ import sys
 import threading
 from typing import Callable
 
+from .devices import DeviceInfo, cpu_device, detect_cuda_devices, select_device
+
 
 LogCallback = Callable[[str], None]
 
@@ -69,6 +71,7 @@ class PipelineConfig:
     reference_dicom: Path | None = None
     phase_count: int = 5
     cuda_diagnostics: bool = False
+    compute_device: str = "auto"
 
     def normalized(self) -> "PipelineConfig":
         reference = self.reference_dicom.expanduser().resolve() if self.reference_dicom else None
@@ -82,11 +85,14 @@ class PipelineConfig:
             reference_dicom=reference,
             phase_count=self.phase_count,
             cuda_diagnostics=self.cuda_diagnostics,
+            compute_device=self.compute_device,
         )
 
     def signature(self) -> str:
         values = asdict(self.normalized())
         values.pop("cuda_diagnostics", None)
+        # Compute hardware does not affect device-independent medical outputs.
+        values.pop("compute_device", None)
         serializable = {key: str(value) for key, value in values.items()}
         return sha256(json.dumps(serializable, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -120,9 +126,48 @@ class FreeTune4DBackend:
     RECONSTRUCT_SCRIPT = "4DMRI Synthesis_UTSW_DVFsmooth_YP_T2_Steps.py"
     SUPPORTED_MODALITIES = {"T2": True, "T1": False}
 
-    def __init__(self, repo_root: Path | None = None, python_executable: str | None = None):
+    def __init__(self, repo_root: Path | None = None, python_executable: str | None = None, device_detector=detect_cuda_devices):
         self.repo_root = (repo_root or Path(__file__).resolve().parents[1]).resolve()
         self.python_executable = python_executable or sys.executable
+        self._device_detector = device_detector
+        self.devices: list[DeviceInfo] = []
+        self.refresh_devices()
+
+    def refresh_devices(self) -> list[DeviceInfo]:
+        self.devices = [cpu_device(), *self._device_detector()]
+        return self.devices
+
+    def resolve_device(self, config: PipelineConfig) -> DeviceInfo | None:
+        return select_device(config.compute_device, self.devices)
+
+    def device_error(self, config: PipelineConfig) -> str | None:
+        selected = self.resolve_device(config)
+        if selected and selected.available and selected.supported:
+            return None
+        if selected and selected.device_type == "cpu":
+            return "Current backend requires CUDA. CPU execution has not been validated and is unavailable."
+        if config.compute_device == "auto":
+            return "No compatible CUDA GPU detected. CPU is unavailable in the current CUDA-only backend."
+        return "The selected CUDA GPU is no longer available. Refresh Compute Device and select another GPU."
+
+    def _configure_device_environment(self, config: PipelineConfig, env: dict[str, str], log: LogCallback) -> DeviceInfo:
+        device = self.resolve_device(config)
+        if device is None or not device.available or not device.supported:
+            raise BackendError(self.device_error(config) or "CUDA GPU unavailable.", kind="invalid_input")
+        env["CUDA_VISIBLE_DEVICES"] = str(device.physical_index)
+        log(f"[DEVICE] Requested: {config.compute_device}")
+        cuda_devices = [candidate for candidate in self.devices if candidate.device_type == "cuda"]
+        log(f"[DEVICE] Detected CUDA GPUs: {len(cuda_devices)}")
+        for candidate in cuda_devices:
+            log(
+                f"[DEVICE] GPU {candidate.physical_index}: {candidate.name}; "
+                f"Total {candidate.total_gib:.2f} GiB; Free {candidate.free_gib:.2f} GiB"
+            )
+        log(f"[DEVICE] Selected physical GPU: {device.physical_index} — {device.name}")
+        log(f"[DEVICE] CUDA_VISIBLE_DEVICES={device.physical_index}")
+        log("[DEVICE] Backend logical CUDA device: cuda:0")
+        log("[DEVICE] CUDA isolation applies to both TensorFlow and PyTorch before import/initialization.")
+        return device
 
     def validate_inputs(self, config: PipelineConfig) -> list[str]:
         config = config.normalized()
@@ -140,9 +185,14 @@ class FreeTune4DBackend:
                 config.output_root.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
                 errors.append(f"Output directory cannot be created: {exc}")
-        for label, model in (("Coarse model", config.coarse_model), ("Fine model", config.fine_model)):
+        for label, filename, model in (
+            ("Coarse", "coarse.h5", config.coarse_model),
+            ("Fine", "fine.h5", config.fine_model),
+        ):
             if not model.is_file():
-                errors.append(f"{label} file does not exist: {model}")
+                errors.append(f"{label} model file not found. Please select a valid {filename} file under Model Settings.")
+            elif model.suffix.lower() not in {".h5", ".hdf5"}:
+                errors.append(f"{label} model must be an HDF5 file (.h5 or .hdf5). Please select it under Model Settings.")
         if config.reference_dicom and not config.reference_dicom.is_file():
             errors.append(f"Reference DICOM file does not exist: {config.reference_dicom}")
         elif config.reference_dicom and config.reference_dicom.parent != config.static_dicom_dir:
@@ -200,6 +250,7 @@ class FreeTune4DBackend:
             "--st_date", "session",
         ]
         env = os.environ.copy()
+        self._configure_device_environment(config, env, log)
         if config.cuda_diagnostics:
             env["CUDA_LAUNCH_BLOCKING"] = "1"
             log("CUDA diagnostic mode enabled for this run: CUDA_LAUNCH_BLOCKING=1")
@@ -257,6 +308,7 @@ class FreeTune4DBackend:
             "--net_path_fine", str(config.fine_model),
         ]
         env = os.environ.copy()
+        self._configure_device_environment(config, env, log)
         pytorch_path = self.repo_root / "voxelmorph-master" / "pytorch"
         env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(pytorch_path), str(self.repo_root), env.get("PYTHONPATH", "")]))
         if config.cuda_diagnostics:
@@ -358,6 +410,8 @@ class FreeTune4DBackend:
         ]
         exception_lines = [line for line in meaningful if re.search(r"(?:error|exception|assert triggered|failed)", line, re.IGNORECASE)]
         root = python_exceptions[-1] if python_exceptions else (exception_lines[-1] if exception_lines else (meaningful[-1] if meaningful else "Backend process failed without diagnostic output."))
+        if "outofmemoryerror" in lowered or "cuda out of memory" in lowered:
+            return "cuda_oom", root
         if "cuda" in lowered or "cudnn" in lowered or "device-side assert" in lowered:
             return "cuda", root
         if any(token in lowered for token in ("load_weights", "model_weights", ".h5", "weight file")):

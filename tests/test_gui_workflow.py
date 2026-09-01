@@ -5,13 +5,20 @@ import unittest
 from freetune4d_gui.backend import BackendError, FreeTune4DBackend, PipelineConfig
 from freetune4d_gui.app import FreeTune4DApp
 from freetune4d_gui.controller import WorkflowController, WorkflowState
+from freetune4d_gui.devices import DeviceInfo, cpu_device, select_device
+from freetune4d_gui.typography import TYPOGRAPHY
 
 
 class SimulatedBackend(FreeTune4DBackend):
     """Executes adapter behavior while simulating only the unavailable subprocess."""
 
+    def __init__(self, repo_root):
+        device = DeviceInfo(2, "Test GPU", 24 * 1024**3, 20 * 1024**3)
+        super().__init__(repo_root, device_detector=lambda: [device])
+
     def _run(self, operation, command, cwd, log, env=None):
         self.last_operation = operation
+        self.last_command = command
         self.last_env = env or {}
         log("simulated subprocess: " + " ".join(command))
         if self.PREPROCESS_SCRIPT in command[1]:
@@ -66,7 +73,11 @@ class BackendAdapterTests(unittest.TestCase):
         t1 = PipelineConfig(**{**self.config.__dict__, "modality": "T1"})
         self.assertIn("not implemented", " ".join(self.backend.validate_inputs(t1)))
         missing = PipelineConfig(**{**self.config.__dict__, "coarse_model": self.models / "missing.h5"})
-        self.assertIn("Coarse model", " ".join(self.backend.validate_inputs(missing)))
+        self.assertIn("select a valid coarse.h5", " ".join(self.backend.validate_inputs(missing)))
+        wrong_extension = self.models / "coarse.bin"
+        wrong_extension.write_bytes(b"model")
+        invalid_type = PipelineConfig(**{**self.config.__dict__, "coarse_model": wrong_extension})
+        self.assertIn("HDF5", " ".join(self.backend.validate_inputs(invalid_type)))
 
     def test_real_adapter_contract_creates_required_output_structure(self):
         logs = []
@@ -82,6 +93,8 @@ class BackendAdapterTests(unittest.TestCase):
         self.assertEqual(2, summary.lq_dicom_count)
         self.assertGreater(summary.qc_file_count, 0)
         self.assertTrue(any("STEP_02" in line for line in logs))
+        self.assertEqual(str(self.config.coarse_model), self.backend.last_command[self.backend.last_command.index("--net_path_coarse") + 1])
+        self.assertEqual(str(self.config.fine_model), self.backend.last_command[self.backend.last_command.index("--net_path_fine") + 1])
 
     def test_manifest_prevents_cross_case_reconstruction(self):
         self.backend.run_preprocessing(self.config, lambda _line: None)
@@ -107,6 +120,13 @@ class BackendAdapterTests(unittest.TestCase):
         self.assertEqual("RuntimeError: CUDA device-side assert triggered", error.root_message)
         self.assertIn("Exact command:", "\n".join(logs))
         self.assertIn("[stderr]", "\n".join(logs))
+
+    def test_cuda_out_of_memory_has_specific_category(self):
+        kind, message = FreeTune4DBackend._classify_failure(
+            "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 932.00 MiB"
+        )
+        self.assertEqual("cuda_oom", kind)
+        self.assertIn("OutOfMemoryError", message)
 
     def test_cuda_diagnostic_mode_is_scoped_to_backend_child(self):
         diagnostic = PipelineConfig(**{**self.config.__dict__, "cuda_diagnostics": True})
@@ -170,16 +190,65 @@ class WorkflowStateTests(unittest.TestCase):
         self.assertEqual(WorkflowState.PREPROCESSED, self.controller.state)
         self.assertTrue(self.controller.can_reconstruct)
 
+    def test_compute_device_change_preserves_device_independent_preprocessing(self):
+        self.controller.inputs_validated(self.config, [])
+        self.controller.start_preprocessing()
+        self.controller.preprocessing_succeeded()
+        changed = PipelineConfig(**{**self.config.__dict__, "compute_device": "cuda:2"})
+        self.controller.inputs_validated(changed, [])
+        self.assertEqual(WorkflowState.PREPROCESSED, self.controller.state)
+        self.assertTrue(self.controller.preprocessing_valid)
+
 
 class GuiLayoutContractTests(unittest.TestCase):
     def test_readable_fonts_and_responsive_layout_contract(self):
         self.assertEqual((65, 35), FreeTune4DApp.COLUMN_WEIGHTS)
         self.assertGreaterEqual(FreeTune4DApp.MINIMUM_SIZE[0], 1100)
         self.assertGreaterEqual(FreeTune4DApp.MINIMUM_SIZE[1], 720)
-        self.assertGreaterEqual(FreeTune4DApp.FONT_SIZES["title"], 22)
-        self.assertGreaterEqual(FreeTune4DApp.FONT_SIZES["section"], 16)
-        self.assertGreaterEqual(FreeTune4DApp.FONT_SIZES["normal"], 13)
-        self.assertGreaterEqual(FreeTune4DApp.FONT_SIZES["log"], 12)
+        self.assertEqual(24, FreeTune4DApp.FONT_SIZES["title"])
+        self.assertEqual(20, FreeTune4DApp.FONT_SIZES["section"])
+        self.assertEqual(17, FreeTune4DApp.FONT_SIZES["normal"])
+        self.assertEqual(15, FreeTune4DApp.FONT_SIZES["log"])
+        self.assertGreaterEqual(TYPOGRAPHY.CONTROL_HEIGHT_PX, 36)
+        self.assertGreaterEqual(TYPOGRAPHY.PRIMARY_HEIGHT_PX, 44)
+        self.assertEqual(700, TYPOGRAPHY.TITLE_WEIGHT)
+        self.assertEqual(600, TYPOGRAPHY.SECTION_WEIGHT)
+        self.assertEqual(500, TYPOGRAPHY.LABEL_WEIGHT)
+        self.assertEqual(400, TYPOGRAPHY.BODY_WEIGHT)
+
+
+class DeviceSelectionTests(unittest.TestCase):
+    def test_cpu_is_first_class_but_explicitly_unsupported(self):
+        cpu = cpu_device()
+        self.assertEqual("cpu", cpu.key)
+        self.assertTrue(cpu.available)
+        self.assertFalse(cpu.supported)
+        self.assertIn("unavailable", cpu.display_name)
+        self.assertIs(cpu, select_device("cpu", [cpu]))
+
+    def test_auto_selects_gpu_with_most_free_memory(self):
+        devices = [
+            DeviceInfo(0, "Busy GPU", 24 * 1024**3, 200 * 1024**2),
+            DeviceInfo(1, "Available GPU", 24 * 1024**3, 20 * 1024**3),
+        ]
+        self.assertEqual(1, select_device("auto", devices).physical_index)
+        self.assertTrue(devices[0].low_memory)
+
+    def test_manual_physical_gpu_is_isolated_for_child(self):
+        device = DeviceInfo(2, "Selected GPU", 24 * 1024**3, 18 * 1024**3)
+        backend = FreeTune4DBackend(device_detector=lambda: [device])
+        config = PipelineConfig(Path("."), Path("."), Path("."), compute_device="cuda:2")
+        env = {}
+        backend._configure_device_environment(config, env, lambda _message: None)
+        self.assertEqual("2", env["CUDA_VISIBLE_DEVICES"])
+
+    def test_backend_rejects_cpu_before_subprocess_launch(self):
+        backend = FreeTune4DBackend(device_detector=lambda: [])
+        config = PipelineConfig(Path("."), Path("."), Path("."), compute_device="cpu")
+        self.assertIn("requires CUDA", backend.device_error(config))
+        with self.assertRaises(BackendError) as caught:
+            backend._configure_device_environment(config, {}, lambda _message: None)
+        self.assertEqual("invalid_input", caught.exception.kind)
 
 
 if __name__ == "__main__":
