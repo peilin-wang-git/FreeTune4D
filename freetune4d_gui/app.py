@@ -71,7 +71,7 @@ class FreeTune4DApp(tk.Tk):
         self.reference_var = tk.StringVar()
         self.phase_var = tk.StringVar(value="5")
         self.cuda_diagnostics_var = tk.BooleanVar(value=False)
-        self.compute_device_var = tk.StringVar(value="Auto (recommended)")
+        self.compute_device_var = tk.StringVar(value="Auto — Recommended")
         self.overall_status_var = tk.StringVar(value="Select valid inputs to begin.")
         self.input_status_var = tk.StringVar(value="Waiting")
         self.preprocess_status_var = tk.StringVar(value="Waiting")
@@ -105,17 +105,17 @@ class FreeTune4DApp(tk.Tk):
         style.configure("TEntry", font="FreeTune4DBody", padding=(8, control_y_padding))
         style.configure("TCombobox", font="FreeTune4DBody", padding=(8, control_y_padding))
         style.configure("TSpinbox", font="FreeTune4DBody", padding=(8, control_y_padding))
-        style.configure("TButton", font="FreeTune4DBody", padding=(12, control_y_padding))
+        style.configure("TButton", font="FreeTune4DMedium", padding=(12, control_y_padding))
         style.configure("Header.TLabel", font="FreeTune4DTitle", foreground="#17324d")
         style.configure("Subheader.TLabel", font="FreeTune4DBody", foreground="#526577")
         style.configure("Section.TLabel", font="FreeTune4DSection", foreground="#17324d")
         style.configure("Section.TLabelframe.Label", font="FreeTune4DSection", foreground="#17324d")
         style.configure("Section.TLabelframe", borderwidth=1, relief="solid")
-        style.configure("Primary.TButton", font="FreeTune4DBodyBold", padding=(16, primary_y_padding))
-        style.configure("StatusName.TLabel", font="FreeTune4DBodyBold")
-        style.configure("Status.TLabel", font="FreeTune4DBody", padding=(9, 6), background="#edf2f6")
-        style.configure("Operation.TLabel", font="FreeTune4DBodyBold", foreground="#17324d")
-        style.configure("Link.TButton", font="FreeTune4DBody", padding=(10, control_y_padding))
+        style.configure("Primary.TButton", font="FreeTune4DSemibold", padding=(16, primary_y_padding))
+        style.configure("StatusName.TLabel", font="FreeTune4DMedium")
+        style.configure("Status.TLabel", font="FreeTune4DMedium", padding=(9, 6), background="#edf2f6")
+        style.configure("Operation.TLabel", font="FreeTune4DMedium", foreground="#17324d")
+        style.configure("Link.TButton", font="FreeTune4DMedium", padding=(10, control_y_padding))
 
     def _build_ui(self) -> None:
         outer = ttk.Frame(self, name="central_widget", padding=(20, 16))
@@ -354,30 +354,35 @@ class FreeTune4DApp(tk.Tk):
     def _refresh_device_list(self, log_devices: bool = True) -> None:
         previous_key = self.device_display_to_key.get(self.compute_device_var.get(), "auto") if hasattr(self, "device_display_to_key") else "auto"
         devices = self.backend.refresh_devices()
-        choices = ["Auto (recommended)"]
-        mapping = {"Auto (recommended)": "auto"}
+        choices = ["Auto — Recommended"]
+        mapping = {"Auto — Recommended": "auto"}
         for device in devices:
             choices.append(device.display_name)
             mapping[device.display_name] = device.key
         self.device_display_to_key = mapping
-        selected_display = next((display for display, key in mapping.items() if key == previous_key), "Auto (recommended)")
+        selected_display = next((display for display, key in mapping.items() if key == previous_key), "Auto — Recommended")
         self.compute_device_combo.configure(values=choices)
         self.compute_device_var.set(selected_display)
         selected = self.backend.resolve_device(self._config())
-        if selected:
+        if selected and selected.device_type == "cpu":
+            self.device_status.configure(
+                text="Current backend requires CUDA. CPU execution has not been validated."
+            )
+        elif selected:
             suffix = " — Low available VRAM" if selected.low_memory else ""
             prefix = "Auto will use " if self._config().compute_device == "auto" else "Selected "
             self.device_status.configure(text=f"{prefix}GPU {selected.physical_index}: {selected.free_gib:.2f}/{selected.total_gib:.2f} GiB free{suffix}")
         else:
             self.device_status.configure(text="No compatible CUDA GPU detected. CPU is unavailable in the current backend.")
         if log_devices and hasattr(self, "log_text"):
-            self._log(f"[DEVICE] Refreshed CUDA devices: {len(devices)} detected")
+            gpu_count = sum(device.device_type == "cuda" for device in devices)
+            self._log(f"[DEVICE] Refreshed CUDA devices: {gpu_count} detected")
 
     def _preflight_device(self, config: PipelineConfig, operation: str) -> bool:
         self._refresh_device_list(log_devices=False)
         config = self._config().normalized()
         device = self.backend.resolve_device(config)
-        if device is None:
+        if device is None or not device.available or not device.supported:
             messagebox.showerror("Compute device unavailable", self.backend.device_error(config))
             return False
         self.active_device = device

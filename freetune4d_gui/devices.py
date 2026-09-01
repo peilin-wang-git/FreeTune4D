@@ -15,15 +15,18 @@ GIB = 1024**3
 
 @dataclass(frozen=True)
 class DeviceInfo:
-    physical_index: int
+    physical_index: int | None
     name: str
     total_bytes: int
     free_bytes: int
     utilization_percent: int | None = None
+    device_type: str = "cuda"
+    available: bool = True
+    supported: bool = True
 
     @property
     def key(self) -> str:
-        return f"cuda:{self.physical_index}"
+        return "cpu" if self.device_type == "cpu" else f"cuda:{self.physical_index}"
 
     @property
     def total_gib(self) -> float:
@@ -36,14 +39,31 @@ class DeviceInfo:
     @property
     def low_memory(self) -> bool:
         # A conservative warning, not a claimed pipeline requirement.
-        return self.free_gib < 1.0 or self.free_bytes < self.total_bytes * 0.05
+        return self.device_type == "cuda" and (
+            self.free_gib < 1.0 or self.free_bytes < self.total_bytes * 0.05
+        )
 
     @property
     def display_name(self) -> str:
+        if self.device_type == "cpu":
+            return "CPU" if self.supported else "CPU — unavailable in current backend"
         return (
             f"GPU {self.physical_index} — {self.name} — "
             f"{self.free_gib:.2f}/{self.total_gib:.2f} GiB free"
         )
+
+
+def cpu_device() -> DeviceInfo:
+    """Return the always-present CPU option with an honest support state."""
+    return DeviceInfo(
+        physical_index=None,
+        name="CPU",
+        total_bytes=0,
+        free_bytes=0,
+        device_type="cpu",
+        available=True,
+        supported=False,
+    )
 
 
 def detect_cuda_devices(timeout: float = 4.0) -> list[DeviceInfo]:
@@ -111,5 +131,9 @@ print(json.dumps(items))
 def select_device(selection: str, devices: list[DeviceInfo]) -> DeviceInfo | None:
     """Resolve ``auto`` or a stable cuda key to a detected physical GPU."""
     if selection == "auto":
-        return max(devices, key=lambda device: device.free_bytes, default=None)
+        compatible_gpus = [
+            device for device in devices
+            if device.device_type == "cuda" and device.available and device.supported
+        ]
+        return max(compatible_gpus, key=lambda device: device.free_bytes, default=None)
     return next((device for device in devices if device.key == selection), None)

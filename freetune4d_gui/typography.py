@@ -17,6 +17,11 @@ class Typography:
     LOG_PX: int = 15
     CONTROL_HEIGHT_PX: int = 38
     PRIMARY_HEIGHT_PX: int = 46
+    BODY_WEIGHT: int = 400
+    LABEL_WEIGHT: int = 500
+    SECTION_WEIGHT: int = 600
+    BUTTON_WEIGHT: int = 600
+    TITLE_WEIGHT: int = 700
 
 
 TYPOGRAPHY = Typography()
@@ -34,9 +39,13 @@ def configure_named_fonts(root: tk.Misc) -> dict[str, tkfont.Font]:
     family = base.actual("family")
     fixed_family = tkfont.nametofont("TkFixedFont", root=root).actual("family")
 
+    # Tk exposes normal/bold rather than numeric OpenType weights.  The named
+    # roles preserve the intended 400/500/600/700 semantic hierarchy while
+    # mapping emphasis roles to the platform's readable bold face.
     roles = {
-        "body": tkfont.Font(root=root, name="FreeTune4DBody", family=family, size=-TYPOGRAPHY.BODY_PX),
-        "body_bold": tkfont.Font(root=root, name="FreeTune4DBodyBold", family=family, size=-TYPOGRAPHY.BODY_PX, weight="bold"),
+        "body": tkfont.Font(root=root, name="FreeTune4DBody", family=family, size=-TYPOGRAPHY.BODY_PX, weight="normal"),
+        "medium": tkfont.Font(root=root, name="FreeTune4DMedium", family=family, size=-TYPOGRAPHY.BODY_PX, weight="bold"),
+        "semibold": tkfont.Font(root=root, name="FreeTune4DSemibold", family=family, size=-TYPOGRAPHY.BODY_PX, weight="bold"),
         "section": tkfont.Font(root=root, name="FreeTune4DSection", family=family, size=-TYPOGRAPHY.SECTION_PX, weight="bold"),
         "title": tkfont.Font(root=root, name="FreeTune4DTitle", family=family, size=-TYPOGRAPHY.TITLE_PX, weight="bold"),
         "log": tkfont.Font(root=root, name="FreeTune4DLog", family=fixed_family, size=-TYPOGRAPHY.LOG_PX),
