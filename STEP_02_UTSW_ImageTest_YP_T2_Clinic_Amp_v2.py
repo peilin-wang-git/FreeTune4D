@@ -26,6 +26,9 @@ p.add_argument('--base_path', type=str, default='/mnt/sda/Academics/Code/MyCode/
 p.add_argument('--MR_number', type=str, default='raw', help="MRN")
 p.add_argument('--st_date', type=str, default="StDate", help='StDate')
 arg = p.parse_args()
+RUNTIME_DEVICE = os.environ.get("FREETUNE4D_DEVICE", "cuda:0")
+if RUNTIME_DEVICE not in {"cpu", "cuda:0"}:
+    raise ValueError(f"Unsupported FREETUNE4D_DEVICE: {RUNTIME_DEVICE}")
 
 def BA_based_amplitude_sorting(FourD, opts):
     """
@@ -331,7 +334,7 @@ def center_crop_or_pad_2d_to_shape(vol, target_x, target_y):
     print(f"[center_crop_or_pad_2d_to_shape] output shape = {out.shape}", flush=True)
     return out
 
-def lcc_score_3d(vol1, vol2, device="cuda:0", eps=1e-8):
+def lcc_score_3d(vol1, vol2, device=RUNTIME_DEVICE, eps=1e-8):
     """
     对两个 shape 相同的 3D 体数据计算 LCC/NCC 分数。
     注意：
@@ -354,7 +357,7 @@ def lcc_score_3d(vol1, vol2, device="cuda:0", eps=1e-8):
     score = -loss
     return score
 
-def lcc_score_overlap_only(fd_ref, t2_xy_aligned, t2_offset, device="cuda:0", min_overlap_ratio=0.5):
+def lcc_score_overlap_only(fd_ref, t2_xy_aligned, t2_offset, device=RUNTIME_DEVICE, min_overlap_ratio=0.5):
     """
     只对 4D 和 T2 当前真正重合的 axial 部分计算 LCC。
 
@@ -417,7 +420,7 @@ def lcc_score_overlap_only(fd_ref, t2_xy_aligned, t2_offset, device="cuda:0", mi
 
     score = lcc_score_3d(fd_part, t2_part, device=device)
     return score, fd_z0, fd_z1, t2_z0, t2_z1, overlap_len, min_required
-def axial_match_by_lcc(fd_crop, t2_xy_aligned, device="cuda:0", vis_path=None, prefix="axial_match"):
+def axial_match_by_lcc(fd_crop, t2_xy_aligned, device=RUNTIME_DEVICE, vis_path=None, prefix="axial_match"):
     print("\n[axial_match_by_lcc] ==========================================", flush=True)
     print(f"[axial_match_by_lcc] fd_crop shape       = {fd_crop.shape}", flush=True)
     print(f"[axial_match_by_lcc] t2_xy_aligned shape = {t2_xy_aligned.shape}", flush=True)
@@ -568,7 +571,7 @@ def clustering(imgs_tmp, class_num=3, path="./tmp"):
 
     os.makedirs(path, exist_ok=True)
     batch_size = 20
-    gl_device = "cuda:0"
+    gl_device = RUNTIME_DEVICE
 
     image_num = imgs.shape[-1]
     matrix = np.ones((image_num, image_num))
@@ -754,7 +757,7 @@ if __name__ == '__main__':
     print(f"[preflight] loaded volume dtype     = {FourD.dtype}", flush=True)
     print(f"[preflight] loaded intensity range  = ({np.min(FourD)}, {np.max(FourD)})", flush=True)
     print(f"[preflight] requested output phases = {arg.phase_num}", flush=True)
-    print(f"[preflight] CUDA device             = cuda:0", flush=True)
+    print(f"[DEVICE] PyTorch device: {RUNTIME_DEVICE}", flush=True)
     if FourD.ndim != 4 or any(size <= 0 for size in FourD.shape):
         raise ValueError(f"Dynamic DICOM must produce a non-empty 4D volume; got shape {FourD.shape}.")
     if FourD.shape[-1] != nTP:
@@ -763,9 +766,12 @@ if __name__ == '__main__':
         raise ValueError(f"Cannot create {arg.phase_num} phases from only {FourD.shape[-1]} temporal frames.")
     if not np.isfinite(FourD).all():
         raise ValueError("Dynamic DICOM volume contains NaN or Inf values before CUDA clustering.")
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA device cuda:0 is required by preprocessing but is not available.")
-    print(f"[preflight] CUDA device name        = {torch.cuda.get_device_name(0)}", flush=True)
+    if RUNTIME_DEVICE == "cuda:0":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA device cuda:0 was requested but is not available.")
+        print(f"[preflight] CUDA device name        = {torch.cuda.get_device_name(0)}", flush=True)
+    else:
+        print("[DEVICE] Backend running on CPU", flush=True)
     print("[preflight] dynamic input is valid for NCC clustering", flush=True)
 
     FourD_all = FourD.copy()
@@ -929,7 +935,7 @@ if __name__ == '__main__':
     fd_aligned, t2_aligned, best_lcc, best_fd_start, best_t2_start = axial_match_by_lcc(
         fd_crop,
         t2_xy_aligned,
-        device="cuda:0",
+        device=RUNTIME_DEVICE,
         vis_path=axial_vis_path,
         prefix="axial_match"
     )

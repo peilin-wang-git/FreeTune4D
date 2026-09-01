@@ -377,14 +377,14 @@ class FreeTune4DApp(tk.Tk):
         selected = self.backend.resolve_device(self._config())
         if selected and selected.device_type == "cpu":
             self.device_status.configure(
-                text="Current backend requires CUDA. CPU execution has not been validated."
+                text="CPU selected — CPU mode may be significantly slower than GPU mode."
             )
         elif selected:
             suffix = " — Low available VRAM" if selected.low_memory else ""
             prefix = "Auto will use " if self._config().compute_device == "auto" else "Selected "
             self.device_status.configure(text=f"{prefix}GPU {selected.physical_index}: {selected.free_gib:.2f}/{selected.total_gib:.2f} GiB free{suffix}")
         else:
-            self.device_status.configure(text="No compatible CUDA GPU detected. CPU is unavailable in the current backend.")
+            self.device_status.configure(text="No compatible compute device detected.")
         if log_devices and hasattr(self, "log_text"):
             gpu_count = sum(device.device_type == "cuda" for device in devices)
             self._log(f"[DEVICE] Refreshed CUDA devices: {gpu_count} detected")
@@ -636,6 +636,8 @@ class FreeTune4DApp(tk.Tk):
             if "device-side assert" in (error.root_message + error.stderr_tail).lower():
                 return f"CUDA device-side assertion detected. {error.root_message}"
             return f"CUDA error occurred during backend {error.operation}. {error.root_message}"
+        if self.active_device and self.active_device.device_type == "cpu" and error.kind == "backend":
+            return f"CPU backend failed during {error.operation}. {error.root_message}"
         labels = {
             "model_loading": "Model loading failed",
             "missing_dependency": "A required backend dependency is unavailable",

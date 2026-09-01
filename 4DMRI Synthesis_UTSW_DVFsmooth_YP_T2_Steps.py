@@ -74,9 +74,10 @@ sys.path.append(os.path.join(cwd,'voxelmorph-master','pytorch'))
 from model import SpatialTransformer
 from model_C2F import Unet
 
-#HyperMorph
-gpu = '0'
-device = 'cuda'
+# HyperMorph / PyTorch use the same device selected by the GUI child environment.
+device = os.environ.get("FREETUNE4D_DEVICE", "cuda:0")
+if device not in {"cpu", "cuda:0"}:
+    raise ValueError(f"Unsupported FREETUNE4D_DEVICE: {device}")
 vol_size=[128,128,128]
 reg_args = dict(
     int_steps=5,
@@ -95,7 +96,13 @@ reg_args_2 = dict(
     svf_resolution=2,
     nb_unet_features=([24] * 4, [24] * 6),
 )
-device_vxm, _ = vxm.tf.utils.setup_device(gpu)
+if device == "cpu":
+    device_vxm = "/CPU:0"
+else:
+    device_vxm, _ = vxm.tf.utils.setup_device("0")
+print(f"[DEVICE] PyTorch device: {device}", flush=True)
+print(f"[DEVICE] TensorFlow device: {device_vxm}", flush=True)
+print(f"[DEVICE] TensorFlow visible GPUs: {len(tf.config.list_physical_devices('GPU'))}", flush=True)
 with tf.device(device_vxm):
     model = vxm.networks.HyperVxmDense(**reg_args)
     model_2 = vxm.networks.HyperVxmDense(**reg_args_2)
