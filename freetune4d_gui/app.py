@@ -20,7 +20,7 @@ from tkinter import filedialog, messagebox, ttk
 from .backend import BackendError, FreeTune4DBackend, OutputSummary, PipelineConfig
 from .controller import WorkflowController, WorkflowState
 from .devices import DeviceInfo
-from .dialogs import choose_directory
+from .dialogs import choose_directory, choose_model_file
 from .typography import TYPOGRAPHY, configure_named_fonts
 
 
@@ -185,6 +185,12 @@ class FreeTune4DApp(tk.Tk):
         self.device_display_to_key: dict[str, str] = {}
         self._refresh_device_list(log_devices=False)
 
+        model_frame = ttk.Labelframe(left, text="Model Settings", padding=14, style="Section.TLabelframe")
+        model_frame.pack(fill="x", pady=(0, 14))
+        model_frame.columnconfigure(1, weight=1)
+        self._file_row(model_frame, 0, "Coarse Model", self.coarse_var, lambda: self._browse_model_file(self.coarse_var))
+        self._file_row(model_frame, 1, "Fine Model", self.fine_var, lambda: self._browse_model_file(self.fine_var))
+
         output_frame = ttk.Labelframe(left, text="Output", padding=14, style="Section.TLabelframe")
         output_frame.pack(fill="x", pady=(0, 14))
         output_frame.columnconfigure(0, weight=1)
@@ -200,18 +206,16 @@ class FreeTune4DApp(tk.Tk):
         self.advanced_toggle.grid(row=0, column=0, sticky="ew")
         self.advanced.columnconfigure(0, weight=1)
         self.advanced_body = ttk.Labelframe(self.advanced, text="Backend Settings", padding=12, style="Section.TLabelframe")
-        self._file_row(self.advanced_body, 0, "Coarse model (coarse.h5)", self.coarse_var, lambda: self._browse_file(self.coarse_var, (("H5 model", "*.h5"),)))
-        self._file_row(self.advanced_body, 1, "Fine model (fine.h5)", self.fine_var, lambda: self._browse_file(self.fine_var, (("H5 model", "*.h5"),)))
-        self._file_row(self.advanced_body, 2, "Reference DICOM (optional)", self.reference_var, lambda: self._browse_file(self.reference_var, (("DICOM", "*.dcm"), ("All files", "*"))))
-        ttk.Label(self.advanced_body, text="Respiratory phases").grid(row=3, column=0, sticky="w", pady=7)
+        self._file_row(self.advanced_body, 0, "Reference DICOM (optional)", self.reference_var, lambda: self._browse_file(self.reference_var, (("DICOM", "*.dcm"), ("All files", "*"))))
+        ttk.Label(self.advanced_body, text="Respiratory phases").grid(row=1, column=0, sticky="w", pady=7)
         self.phase_spin = ttk.Spinbox(self.advanced_body, from_=1, to=65, textvariable=self.phase_var, width=8)
-        self.phase_spin.grid(row=3, column=1, sticky="w", padx=8, pady=7)
+        self.phase_spin.grid(row=1, column=1, sticky="w", padx=8, pady=7)
         self.cuda_diagnostics_check = ttk.Checkbutton(
             self.advanced_body,
             text="CUDA diagnostic mode (CUDA_LAUNCH_BLOCKING=1; slower)",
             variable=self.cuda_diagnostics_var,
         )
-        self.cuda_diagnostics_check.grid(row=4, column=0, columnspan=3, sticky="w", pady=(7, 2))
+        self.cuda_diagnostics_check.grid(row=2, column=0, columnspan=3, sticky="w", pady=(7, 2))
         self.advanced_controls.append(self.cuda_diagnostics_check)
         self.advanced_body.columnconfigure(1, weight=1)
 
@@ -300,7 +304,7 @@ class FreeTune4DApp(tk.Tk):
         return entry, button
 
     def _file_row(self, parent, row, label, variable, command):
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=7)
+        ttk.Label(parent, text=label, style="StatusName.TLabel").grid(row=row, column=0, sticky="w", pady=7)
         entry = ttk.Entry(parent, textvariable=variable)
         entry.grid(row=row, column=1, sticky="ew", padx=8, pady=7)
         button = ttk.Button(parent, text="Browse...", width=10, command=command)
@@ -330,6 +334,13 @@ class FreeTune4DApp(tk.Tk):
         selected = filedialog.askopenfilename(initialdir=str(Path(variable.get()).parent) if variable.get() else str(Path.home()), filetypes=filetypes)
         if selected:
             variable.set(selected)
+
+    def _browse_model_file(self, variable: tk.StringVar) -> None:
+        initial = Path(variable.get()) if variable.get().strip() else self.last_directory
+        selected = choose_model_file(self, initial)
+        if selected:
+            self.last_directory = selected.parent
+            variable.set(str(selected))
 
     def _config(self) -> PipelineConfig:
         modality = "T1" if self.modality_var.get().startswith("T1") else "T2"
@@ -593,6 +604,8 @@ class FreeTune4DApp(tk.Tk):
         self._log(f"Static input: {config.static_dicom_dir}")
         self._log(f"Modality: {config.modality}")
         self._log(f"Output root: {config.output_root}")
+        self._log(f"[MODEL] Coarse: {config.coarse_model}")
+        self._log(f"[MODEL] Fine: {config.fine_model}")
         self._log(f"Respiratory phases: {config.phase_count}")
         self._log(f"CUDA diagnostic mode: {'enabled' if config.cuda_diagnostics else 'disabled'}")
         self._log(f"Compute device mode: {config.compute_device}")

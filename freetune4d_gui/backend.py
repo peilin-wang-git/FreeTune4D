@@ -185,9 +185,14 @@ class FreeTune4DBackend:
                 config.output_root.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
                 errors.append(f"Output directory cannot be created: {exc}")
-        for label, model in (("Coarse model", config.coarse_model), ("Fine model", config.fine_model)):
+        for label, filename, model in (
+            ("Coarse", "coarse.h5", config.coarse_model),
+            ("Fine", "fine.h5", config.fine_model),
+        ):
             if not model.is_file():
-                errors.append(f"{label} file does not exist: {model}")
+                errors.append(f"{label} model file not found. Please select a valid {filename} file under Model Settings.")
+            elif model.suffix.lower() not in {".h5", ".hdf5"}:
+                errors.append(f"{label} model must be an HDF5 file (.h5 or .hdf5). Please select it under Model Settings.")
         if config.reference_dicom and not config.reference_dicom.is_file():
             errors.append(f"Reference DICOM file does not exist: {config.reference_dicom}")
         elif config.reference_dicom and config.reference_dicom.parent != config.static_dicom_dir:

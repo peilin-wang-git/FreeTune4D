@@ -44,7 +44,8 @@ class DirectoryDialog(tk.Toplevel):
         actions.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         ttk.Button(actions, text="Up", command=self._go_up).pack(side="left")
         ttk.Button(actions, text="Cancel", command=self.destroy).pack(side="right")
-        ttk.Button(actions, text="Select Folder", command=self._accept).pack(side="right", padx=(0, 10))
+        self.select_button = ttk.Button(actions, text="Select Folder", command=self._accept)
+        self.select_button.pack(side="right", padx=(0, 10))
 
         style = ttk.Style(self)
         style.configure(
@@ -105,5 +106,51 @@ class DirectoryDialog(tk.Toplevel):
 
 def choose_directory(parent: tk.Misc, initial_directory: Path) -> Path | None:
     dialog = DirectoryDialog(parent, initial_directory)
+    parent.wait_window(dialog)
+    return dialog.result
+
+
+class ModelFileDialog(DirectoryDialog):
+    """Readable application-controlled picker for local HDF5 model files."""
+
+    def __init__(self, parent: tk.Misc, initial_path: Path):
+        super().__init__(parent, initial_path)
+        self.title("Select HDF5 Model File")
+        self.select_button.configure(text="Select Model")
+
+    def _populate(self) -> None:
+        self.path_var.set(str(self.current))
+        self.tree.delete(*self.tree.get_children())
+        try:
+            items = sorted(
+                (
+                    path for path in self.current.iterdir()
+                    if path.is_dir() or (path.is_file() and path.suffix.lower() in {".h5", ".hdf5"})
+                ),
+                key=lambda path: (path.is_file(), path.name.casefold()),
+            )
+        except OSError:
+            items = []
+        for item in items:
+            suffix = "" if item.is_dir() else "  [HDF5 model]"
+            self.tree.insert("", "end", iid=str(item), text=item.name + suffix)
+
+    def _open_selected(self, _event=None) -> None:
+        selected = self._selected_path()
+        if selected and selected.is_file():
+            self._accept()
+        elif selected and selected.is_dir():
+            self.current = selected.resolve()
+            self._populate()
+
+    def _accept(self) -> None:
+        selected = self._selected_path()
+        if selected and selected.is_file() and selected.suffix.lower() in {".h5", ".hdf5"}:
+            self.result = selected.resolve()
+            self.destroy()
+
+
+def choose_model_file(parent: tk.Misc, initial_path: Path) -> Path | None:
+    dialog = ModelFileDialog(parent, initial_path)
     parent.wait_window(dialog)
     return dialog.result
