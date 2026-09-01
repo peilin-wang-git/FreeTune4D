@@ -18,6 +18,7 @@ class SimulatedBackend(FreeTune4DBackend):
 
     def _run(self, operation, command, cwd, log, env=None):
         self.last_operation = operation
+        self.last_command = command
         self.last_env = env or {}
         log("simulated subprocess: " + " ".join(command))
         if self.PREPROCESS_SCRIPT in command[1]:
@@ -72,7 +73,11 @@ class BackendAdapterTests(unittest.TestCase):
         t1 = PipelineConfig(**{**self.config.__dict__, "modality": "T1"})
         self.assertIn("not implemented", " ".join(self.backend.validate_inputs(t1)))
         missing = PipelineConfig(**{**self.config.__dict__, "coarse_model": self.models / "missing.h5"})
-        self.assertIn("Coarse model", " ".join(self.backend.validate_inputs(missing)))
+        self.assertIn("select a valid coarse.h5", " ".join(self.backend.validate_inputs(missing)))
+        wrong_extension = self.models / "coarse.bin"
+        wrong_extension.write_bytes(b"model")
+        invalid_type = PipelineConfig(**{**self.config.__dict__, "coarse_model": wrong_extension})
+        self.assertIn("HDF5", " ".join(self.backend.validate_inputs(invalid_type)))
 
     def test_real_adapter_contract_creates_required_output_structure(self):
         logs = []
@@ -88,6 +93,8 @@ class BackendAdapterTests(unittest.TestCase):
         self.assertEqual(2, summary.lq_dicom_count)
         self.assertGreater(summary.qc_file_count, 0)
         self.assertTrue(any("STEP_02" in line for line in logs))
+        self.assertEqual(str(self.config.coarse_model), self.backend.last_command[self.backend.last_command.index("--net_path_coarse") + 1])
+        self.assertEqual(str(self.config.fine_model), self.backend.last_command[self.backend.last_command.index("--net_path_fine") + 1])
 
     def test_manifest_prevents_cross_case_reconstruction(self):
         self.backend.run_preprocessing(self.config, lambda _line: None)
