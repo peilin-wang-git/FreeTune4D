@@ -48,7 +48,7 @@ class DirectoryDialog(tk.Toplevel):
 
         style = ttk.Style(self)
         style.configure(
-            "Directory.Treeview", font="FreeTune4DBody",
+            "Directory.Treeview", font="FreeTune4DMedium",
             rowheight=max(TYPOGRAPHY.CONTROL_HEIGHT_PX, TYPOGRAPHY.BODY_PX + 14),
         )
         self._populate()

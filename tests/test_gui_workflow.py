@@ -5,7 +5,7 @@ import unittest
 from freetune4d_gui.backend import BackendError, FreeTune4DBackend, PipelineConfig
 from freetune4d_gui.app import FreeTune4DApp
 from freetune4d_gui.controller import WorkflowController, WorkflowState
-from freetune4d_gui.devices import DeviceInfo, select_device
+from freetune4d_gui.devices import DeviceInfo, cpu_device, select_device
 from freetune4d_gui.typography import TYPOGRAPHY
 
 
@@ -204,9 +204,21 @@ class GuiLayoutContractTests(unittest.TestCase):
         self.assertEqual(15, FreeTune4DApp.FONT_SIZES["log"])
         self.assertGreaterEqual(TYPOGRAPHY.CONTROL_HEIGHT_PX, 36)
         self.assertGreaterEqual(TYPOGRAPHY.PRIMARY_HEIGHT_PX, 44)
+        self.assertEqual(700, TYPOGRAPHY.TITLE_WEIGHT)
+        self.assertEqual(600, TYPOGRAPHY.SECTION_WEIGHT)
+        self.assertEqual(500, TYPOGRAPHY.LABEL_WEIGHT)
+        self.assertEqual(400, TYPOGRAPHY.BODY_WEIGHT)
 
 
 class DeviceSelectionTests(unittest.TestCase):
+    def test_cpu_is_first_class_but_explicitly_unsupported(self):
+        cpu = cpu_device()
+        self.assertEqual("cpu", cpu.key)
+        self.assertTrue(cpu.available)
+        self.assertFalse(cpu.supported)
+        self.assertIn("unavailable", cpu.display_name)
+        self.assertIs(cpu, select_device("cpu", [cpu]))
+
     def test_auto_selects_gpu_with_most_free_memory(self):
         devices = [
             DeviceInfo(0, "Busy GPU", 24 * 1024**3, 200 * 1024**2),
@@ -222,6 +234,14 @@ class DeviceSelectionTests(unittest.TestCase):
         env = {}
         backend._configure_device_environment(config, env, lambda _message: None)
         self.assertEqual("2", env["CUDA_VISIBLE_DEVICES"])
+
+    def test_backend_rejects_cpu_before_subprocess_launch(self):
+        backend = FreeTune4DBackend(device_detector=lambda: [])
+        config = PipelineConfig(Path("."), Path("."), Path("."), compute_device="cpu")
+        self.assertIn("requires CUDA", backend.device_error(config))
+        with self.assertRaises(BackendError) as caught:
+            backend._configure_device_environment(config, {}, lambda _message: None)
+        self.assertEqual("invalid_input", caught.exception.kind)
 
 
 if __name__ == "__main__":

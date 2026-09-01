@@ -16,7 +16,7 @@ import sys
 import threading
 from typing import Callable
 
-from .devices import DeviceInfo, detect_cuda_devices, select_device
+from .devices import DeviceInfo, cpu_device, detect_cuda_devices, select_device
 
 
 LogCallback = Callable[[str], None]
@@ -134,27 +134,31 @@ class FreeTune4DBackend:
         self.refresh_devices()
 
     def refresh_devices(self) -> list[DeviceInfo]:
-        self.devices = self._device_detector()
+        self.devices = [cpu_device(), *self._device_detector()]
         return self.devices
 
     def resolve_device(self, config: PipelineConfig) -> DeviceInfo | None:
         return select_device(config.compute_device, self.devices)
 
     def device_error(self, config: PipelineConfig) -> str | None:
-        if self.resolve_device(config):
+        selected = self.resolve_device(config)
+        if selected and selected.available and selected.supported:
             return None
+        if selected and selected.device_type == "cpu":
+            return "Current backend requires CUDA. CPU execution has not been validated and is unavailable."
         if config.compute_device == "auto":
             return "No compatible CUDA GPU detected. CPU is unavailable in the current CUDA-only backend."
         return "The selected CUDA GPU is no longer available. Refresh Compute Device and select another GPU."
 
     def _configure_device_environment(self, config: PipelineConfig, env: dict[str, str], log: LogCallback) -> DeviceInfo:
         device = self.resolve_device(config)
-        if device is None:
+        if device is None or not device.available or not device.supported:
             raise BackendError(self.device_error(config) or "CUDA GPU unavailable.", kind="invalid_input")
         env["CUDA_VISIBLE_DEVICES"] = str(device.physical_index)
         log(f"[DEVICE] Requested: {config.compute_device}")
-        log(f"[DEVICE] Detected CUDA GPUs: {len(self.devices)}")
-        for candidate in self.devices:
+        cuda_devices = [candidate for candidate in self.devices if candidate.device_type == "cuda"]
+        log(f"[DEVICE] Detected CUDA GPUs: {len(cuda_devices)}")
+        for candidate in cuda_devices:
             log(
                 f"[DEVICE] GPU {candidate.physical_index}: {candidate.name}; "
                 f"Total {candidate.total_gib:.2f} GiB; Free {candidate.free_gib:.2f} GiB"
