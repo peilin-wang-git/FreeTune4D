@@ -218,12 +218,12 @@ class GuiLayoutContractTests(unittest.TestCase):
 
 
 class DeviceSelectionTests(unittest.TestCase):
-    def test_cpu_is_first_class_but_explicitly_unsupported(self):
+    def test_cpu_is_first_class_and_supported(self):
         cpu = cpu_device()
         self.assertEqual("cpu", cpu.key)
         self.assertTrue(cpu.available)
-        self.assertFalse(cpu.supported)
-        self.assertIn("unavailable", cpu.display_name)
+        self.assertTrue(cpu.supported)
+        self.assertEqual("CPU — slower", cpu.display_name)
         self.assertIs(cpu, select_device("cpu", [cpu]))
 
     def test_auto_selects_gpu_with_most_free_memory(self):
@@ -241,14 +241,29 @@ class DeviceSelectionTests(unittest.TestCase):
         env = {}
         backend._configure_device_environment(config, env, lambda _message: None)
         self.assertEqual("2", env["CUDA_VISIBLE_DEVICES"])
+        self.assertEqual("cuda:0", env["FREETUNE4D_DEVICE"])
 
-    def test_backend_rejects_cpu_before_subprocess_launch(self):
+    def test_backend_maps_cpu_to_hidden_cuda_and_cpu_runtime(self):
         backend = FreeTune4DBackend(device_detector=lambda: [])
         config = PipelineConfig(Path("."), Path("."), Path("."), compute_device="cpu")
-        self.assertIn("requires CUDA", backend.device_error(config))
-        with self.assertRaises(BackendError) as caught:
-            backend._configure_device_environment(config, {}, lambda _message: None)
-        self.assertEqual("invalid_input", caught.exception.kind)
+        self.assertIsNone(backend.device_error(config))
+        env = {}
+        backend._configure_device_environment(config, env, lambda _message: None)
+        self.assertEqual("", env["CUDA_VISIBLE_DEVICES"])
+        self.assertEqual("cpu", env["FREETUNE4D_DEVICE"])
+
+    def test_auto_falls_back_to_cpu_without_gpu(self):
+        backend = FreeTune4DBackend(device_detector=lambda: [])
+        config = PipelineConfig(Path("."), Path("."), Path("."), compute_device="auto")
+        self.assertEqual("cpu", backend.resolve_device(config).key)
+
+    def test_active_pipeline_scripts_consume_runtime_device(self):
+        root = Path(__file__).resolve().parents[1]
+        preprocessing = (root / FreeTune4DBackend.PREPROCESS_SCRIPT).read_text(encoding="utf-8")
+        reconstruction = (root / FreeTune4DBackend.RECONSTRUCT_SCRIPT).read_text(encoding="utf-8")
+        self.assertIn('RUNTIME_DEVICE = os.environ.get("FREETUNE4D_DEVICE"', preprocessing)
+        self.assertIn('device = os.environ.get("FREETUNE4D_DEVICE"', reconstruction)
+        self.assertIn('device_vxm = "/CPU:0"', reconstruction)
 
 
 if __name__ == "__main__":

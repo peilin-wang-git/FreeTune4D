@@ -144,18 +144,27 @@ class FreeTune4DBackend:
         selected = self.resolve_device(config)
         if selected and selected.available and selected.supported:
             return None
-        if selected and selected.device_type == "cpu":
-            return "Current backend requires CUDA. CPU execution has not been validated and is unavailable."
         if config.compute_device == "auto":
-            return "No compatible CUDA GPU detected. CPU is unavailable in the current CUDA-only backend."
-        return "The selected CUDA GPU is no longer available. Refresh Compute Device and select another GPU."
+            return "No compatible compute device is available."
+        return "The selected compute device is no longer available. Refresh Compute Device and select another device."
 
     def _configure_device_environment(self, config: PipelineConfig, env: dict[str, str], log: LogCallback) -> DeviceInfo:
         device = self.resolve_device(config)
         if device is None or not device.available or not device.supported:
             raise BackendError(self.device_error(config) or "CUDA GPU unavailable.", kind="invalid_input")
-        env["CUDA_VISIBLE_DEVICES"] = str(device.physical_index)
         log(f"[DEVICE] Requested: {config.compute_device}")
+        if device.device_type == "cpu":
+            env["CUDA_VISIBLE_DEVICES"] = ""
+            env["FREETUNE4D_DEVICE"] = "cpu"
+            log('[DEVICE] CUDA_VISIBLE_DEVICES=""')
+            log("[DEVICE] Backend device: cpu")
+            log("[DEVICE] PyTorch device: cpu")
+            log("[DEVICE] TensorFlow device: /CPU:0")
+            log("[DEVICE] TensorFlow visible GPUs: 0 (CUDA hidden from child process)")
+            log("[DEVICE] Backend running on CPU; CPU mode may be significantly slower than GPU mode.")
+            return device
+        env["CUDA_VISIBLE_DEVICES"] = str(device.physical_index)
+        env["FREETUNE4D_DEVICE"] = "cuda:0"
         cuda_devices = [candidate for candidate in self.devices if candidate.device_type == "cuda"]
         log(f"[DEVICE] Detected CUDA GPUs: {len(cuda_devices)}")
         for candidate in cuda_devices:

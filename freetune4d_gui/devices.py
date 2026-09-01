@@ -46,7 +46,7 @@ class DeviceInfo:
     @property
     def display_name(self) -> str:
         if self.device_type == "cpu":
-            return "CPU" if self.supported else "CPU — unavailable in current backend"
+            return "CPU — slower" if self.supported else "CPU — unavailable in current backend"
         return (
             f"GPU {self.physical_index} — {self.name} — "
             f"{self.free_gib:.2f}/{self.total_gib:.2f} GiB free"
@@ -62,7 +62,7 @@ def cpu_device() -> DeviceInfo:
         free_bytes=0,
         device_type="cpu",
         available=True,
-        supported=False,
+        supported=True,
     )
 
 
@@ -135,5 +135,10 @@ def select_device(selection: str, devices: list[DeviceInfo]) -> DeviceInfo | Non
             device for device in devices
             if device.device_type == "cuda" and device.available and device.supported
         ]
-        return max(compatible_gpus, key=lambda device: device.free_bytes, default=None)
+        if compatible_gpus:
+            return max(compatible_gpus, key=lambda device: device.free_bytes)
+        return next(
+            (device for device in devices if device.device_type == "cpu" and device.available and device.supported),
+            None,
+        )
     return next((device for device in devices if device.key == selection), None)
