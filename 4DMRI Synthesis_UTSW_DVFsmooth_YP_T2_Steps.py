@@ -253,7 +253,7 @@ T2 = sio.loadmat(mat_path)['T2_save']
 peilin.plot_3DLiver(FourD[..., 0], name="FourD_raw", path = "./tmp_plot", min=0, max=1)
 peilin.plot_3DLiver(T2, name="T2_raw", path = "./tmp_plot", min=0, max=1)
 
-plt.imshow(T2[..., 80], cmap='gray', interpolation=None, aspect=None)
+plt.imshow(T2[..., 40], cmap='gray', interpolation=None, aspect=None)
 plt.show()
 # Load T2 images
 T2_dicoms = glob.glob(os.path.join(T2_path, 'IM-*'))
@@ -289,9 +289,9 @@ import os
 import scipy.io as sio
 import matplotlib.pyplot as plt
 import shutil
-import oct2py
+# import oct2py
 # os.environ['OCTAVE_EXECUTABLE'] = shutil.which(r'C:\Users\S217615\AppData\Local\Programs\GNU Octave\Octave-6.4.0\mingw64\bin\octave-cli.exe')
-oc = oct2py.Oct2Py()
+# oc = oct2py.Oct2Py()
 elastix_path = os.path.join(os.getcwd(), 'elastix-5.0.1-win64')
 matlab_elastix_path = os.path.join(os.getcwd(), 'matlab_elastix-master')
 octave_tablicious_path = os.path.join(os.getcwd(), 'octave-tablicious-master')
@@ -306,11 +306,11 @@ parameter_path_2 = os.path.join(os.getcwd(), 'Par0020bspline2 - MI.txt')
 parameter_path_3 = os.path.join(os.getcwd(), 'Par0020bspline2 - MI - 2.txt')
 parameter_path_4 = os.path.join(os.getcwd(), 'parameters_BSpline.txt')
 
-oc.addpath(oc.genpath(elastix_path))
-oc.addpath(oc.genpath(octave_tablicious_path))
-oc.addpath(oc.genpath(matlab_elastix_path))
-oc.addpath(oc.genpath(yamlmatlab_path))
-oc.addpath(oc.genpath(addMfile_path))
+# oc.addpath(oc.genpath(elastix_path))
+# oc.addpath(oc.genpath(octave_tablicious_path))
+# oc.addpath(oc.genpath(matlab_elastix_path))
+# oc.addpath(oc.genpath(yamlmatlab_path))
+# oc.addpath(oc.genpath(addMfile_path))
 
 #---------- Register T2 to the selected frame----------
 os.makedirs(temp_path_1, exist_ok=True)
