@@ -1,534 +1,603 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Thu Dec  8 17:35:20 2022
+"""FreeTune4D T2 motion reconstruction pipeline.
 
-@author: user
-"""
-
-# -*- coding: utf-8 -*-
-"""
-Created on Sat Sep 17 11:10:03 2022
-S217615@Gu6kRYxuF1
-
-@author: user
+The stage functions are structural wrappers around the original registration,
+DVF, inference, and DICOM export operations.
 """
 
-try:
-    import sys # Just in case
-    start = sys.version.index('|') # Do we have a modified sys.version?
-    end = sys.version.index('|', start + 1)
-    version_bak = sys.version # Backup modified sys.version
-    sys.version = sys.version.replace(sys.version[start:end+1], '') # Make it legible for platform module
-    import platform
-    platform.python_implementation() # Ignore result, we just need cache populated
-    platform._sys_version_cache[version_bak] = platform._sys_version_cache[sys.version] # Duplicate cache
-    sys.version = version_bak # Restore modified version string
-except ValueError: # Catch .index() method not finding a pipe
-    pass
+import argparse
+import glob
+import importlib
+import os
+import subprocess
+import sys
+import time
 
+import nibabel as nib
+import numpy as np
+import pydicom
+import scipy.interpolate as interpolate
+import scipy.io as sio
 import SimpleITK as sitk
 import tensorflow as tf
 import torch
 import torch.nn.functional as F
-import pydicom
-import os
-from scipy.ndimage import zoom
-import numpy as np
-import math
-import matplotlib
-matplotlib.use('Agg')  # 使用Agg后端
-import matplotlib.pyplot as plt
-import time
-import scipy.io as sio
 import voxelmorph as vxm
-import scipy.interpolate as interpolate
-import glob
-from skimage.metrics import structural_similarity as SSIM
+
 import peilin
-import argparse
 
-bases = (argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter)
-p = argparse.ArgumentParser(
-    formatter_class=type('formatter', bases, {}),
-    description=f'FreeTune4D for UTSouthWestern',
+# Preserve the original local PyTorch SpatialTransformer implementation.
+MODEL_SOURCE_ROOT = (
+    r"/mnt/sda/Academics/Code/MyCode/UltraRecon-4D/DDEM.Liver/uq4d_scripts"
 )
+sys.path.append(os.path.join(MODEL_SOURCE_ROOT, "voxelmorph-master", "pytorch"))
+SpatialTransformer = importlib.import_module("model").SpatialTransformer
 
-p.add_argument('--base_path', type=str, default='/mnt/sda/Academics/Code/MyCode/UltraRecon-4D/26042101Foll25092901.Liver', help="base path of 3D/4D image")
-p.add_argument('--MR_number', type=str, default="92441064", help="MRN")
-p.add_argument('--st_date', type=str, default="20260410", help='StDate')
-p.add_argument('--net_path_coarse', type=str, default="/mnt/sda/Academics/Code/MyCode/UltraRecon-4D/26042101Foll25092901.Liver/coarse.h5", help='path to network')
-p.add_argument('--net_path_fine', type=str, default="/mnt/sda/Academics/Code/MyCode/UltraRecon-4D/26042101Foll25092901.Liver/fine.h5", help='path to network')
-p.add_argument('--name_3d', type=str, default="T2_AX_MVXD", help='name of 3D image')
-p.add_argument('--reference_file', type=str, default="IM-301-0001.dcm", help="reference file for header of dicom")
-arg = p.parse_args()
+# Pipeline switches. Defaults reproduce the original full pipeline.
+ENABLE_AFFINE_ALIGNMENT = True  # Existing Elastix Rigid stage.
+ENABLE_BSPLINE_ALIGNMENT = True
+ENABLE_COARSE_ALIGNMENT = True
+ENABLE_DVF_SMOOTHING = True
+ENABLE_FINE_ALIGNMENT = True
+ENABLE_QC_OUTPUTS = True
+ENABLE_INTERMEDIATE_OUTPUTS = True
+ENABLE_UQ_DICOM_EXPORT = True
+ENABLE_LQ_DICOM_EXPORT = True
 
-
-Net_path = arg.net_path_coarse
-Net_path_2 = arg.net_path_fine
-
-start = time.time()
-
-import sys
-cwd = r'/mnt/sda/Academics/Code/MyCode/UltraRecon-4D/DDEM.Liver/uq4d_scripts'
-sys.path.append(os.path.join(cwd,'voxelmorph-master','pytorch'))
-from model import SpatialTransformer
-from model_C2F import Unet
-
-# HyperMorph / PyTorch use the same device selected by the GUI child environment.
-device = os.environ.get("FREETUNE4D_DEVICE", "cuda:0")
-if device not in {"cpu", "cuda:0"}:
-    raise ValueError(f"Unsupported FREETUNE4D_DEVICE: {device}")
-vol_size=[128,128,128]
-reg_args = dict(
-    int_steps=5,
-    reg_field = 'warp',
-    inshape = vol_size,
-    int_resolution=2,
-    svf_resolution=2,
-    nb_unet_features=([64] * 4, [64] * 6)
-)
-vol_size_2=[224,224,224]
-reg_args_2 = dict(
-    int_steps=5,
-    reg_field = 'warp',
-    inshape = vol_size_2,
-    int_resolution=2,
-    svf_resolution=2,
-    nb_unet_features=([24] * 4, [24] * 6),
-)
-if device == "cpu":
-    device_vxm = "/CPU:0"
-else:
-    device_vxm, _ = vxm.tf.utils.setup_device("0")
-print(f"[DEVICE] PyTorch device: {device}", flush=True)
-print(f"[DEVICE] TensorFlow device: {device_vxm}", flush=True)
-print(f"[DEVICE] TensorFlow visible GPUs: {len(tf.config.list_physical_devices('GPU'))}", flush=True)
-with tf.device(device_vxm):
-    model = vxm.networks.HyperVxmDense(**reg_args)
-    model_2 = vxm.networks.HyperVxmDense(**reg_args_2)
-    model = peilin.inspect_weight_loading(model, Net_path)
-    model_2 = peilin.inspect_weight_loading(model_2, Net_path_2)
-        
-frame_limit = 64
-
-amplifier = 1.0
-
-base_path = arg.base_path
-MRN=arg.MR_number
-StDate=arg.st_date
-ThreeDImg=arg.name_3d
-ImgName=arg.reference_file
-
-HKU_header_path = os.path.join(base_path, MRN, StDate, ThreeDImg, ImgName)
-HKU_header = pydicom.dcmread(HKU_header_path)
-T2_path = os.path.join(base_path, MRN, StDate, ThreeDImg)
-mat_path = os.path.join(base_path, MRN, StDate, "phase_T2.mat") 
-Output_path = os.path.join(base_path, MRN, StDate, "UQ_4D_T2") 
-os.makedirs(Output_path, exist_ok=True)
-patient_name = MRN
-patient_id = MRN
+COARSE_VOLUME_SIZE = [128, 128, 128]
+FINE_VOLUME_SIZE = [224, 224, 224]
+AMPLIFIER = 1.0
 
 
-def dvf_interp(dvf, vol_size):
-    orig_shape = dvf.shape[2:]
-    DVF_0 = F.interpolate(torch.unsqueeze(dvf[:,0,:,:,:],1), vol_size, mode = 'trilinear')
-    DVF_1 = F.interpolate(torch.unsqueeze(dvf[:,1,:,:,:],1), vol_size, mode = 'trilinear')
-    DVF_2 = F.interpolate(torch.unsqueeze(dvf[:,2,:,:,:],1), vol_size, mode = 'trilinear')
-    DVF_0 = DVF_0 * (vol_size[0]/orig_shape[0])
-    DVF_1 = DVF_1 * (vol_size[1]/orig_shape[1])
-    DVF_2 = DVF_2 * (vol_size[2]/orig_shape[2])
-    DVF = torch.cat([DVF_0,DVF_1,DVF_2],1)
-    return DVF
+def build_argument_parser():
+    """Build the command-line interface used by the original script."""
+    bases = (
+        argparse.ArgumentDefaultsHelpFormatter,
+        argparse.RawDescriptionHelpFormatter,
+    )
+    parser = argparse.ArgumentParser(
+        formatter_class=type("formatter", bases, {}),
+        description="FreeTune4D for UTSouthWestern",
+    )
+    parser.add_argument(
+        "--base_path",
+        type=str,
+        default="/mnt/sda/Academics/Code/MyCode/UltraRecon-4D/26042101Foll25092901.Liver",
+    )
+    parser.add_argument("--MR_number", type=str, default="92441064", help="MRN")
+    parser.add_argument("--st_date", type=str, default="20260410", help="StDate")
+    parser.add_argument(
+        "--net_path_coarse",
+        type=str,
+        default="/mnt/sda/Academics/Code/MyCode/UltraRecon-4D/26042101Foll25092901.Liver/coarse.h5",
+    )
+    parser.add_argument(
+        "--net_path_fine",
+        type=str,
+        default="/mnt/sda/Academics/Code/MyCode/UltraRecon-4D/26042101Foll25092901.Liver/fine.h5",
+    )
+    parser.add_argument("--name_3d", type=str, default="T2_AX_MVXD")
+    parser.add_argument("--reference_file", type=str, default="IM-301-0001.dcm")
+    return parser
 
-def img_norm(img):
-    max_val = np.max(img)
-    min_val = np.min(img)
-    img = img * np.array((1/(max_val-min_val)))
-    return img
 
-def img_restore(img, orig_size):
-    img_restored = np.zeros(list(orig_size))
-    pad = np.array(orig_size) - np.array(img.shape)
-    if pad[0] % 2 == 0:
-        dim0_start = int(pad[0]/2)
-        dim0_end = -int(pad[0]/2)
-    else:
-        dim0_start = int(pad[0]/2)+1
-        dim0_end = -int(pad[0]/2)
-    if pad[1] % 2 == 0:
-        dim1_start = int(pad[1]/2)
-        dim1_end = -int(pad[1]/2)
-    else:
-        dim1_start = int(pad[1]/2)+1
-        dim1_end = -int(pad[1]/2)
-    if pad[2] % 2 == 0:
-        dim2_start = int(pad[2]/2)
-        dim2_end = -int(pad[2]/2)
-    else:
-        dim2_start = int(pad[2]/2)+1
-        dim2_end = -int(pad[2]/2)
-    img_restored[dim0_start:dim0_end, dim1_start:dim1_end, dim2_start:dim2_end] = img
-    return img_restored
+def dvf_interp(dvf, volume_size):
+    """Interpolate the existing three-channel DVF and preserve displacement scale."""
+    original_shape = dvf.shape[2:]
+    components = [
+        F.interpolate(
+            torch.unsqueeze(dvf[:, index, :, :, :], 1), volume_size, mode="trilinear"
+        )
+        * (volume_size[index] / original_shape[index])
+        for index in range(3)
+    ]
+    return torch.cat(components, 1)
 
-def compute_cc(img1, img2):
-    mean_1 = np.mean(img1[:])
-    mean_2 = np.mean(img2[:])
-    std_1 = np.std(img1[:])
-    std_2 = np.std(img2[:])
-    top = np.mean((img1-mean_1)*(img2-mean_2))
-    bot = std_1 * std_2
-    cc = top/bot
-    return cc
 
-def DVF_smooth(DVF, no_phase):
-    # input a concatenation of DVF_x, DVF_y, or DVF_z in n phases, i.e., 128x128
-    # x64xn. Return a smoothed DVF, also 128x128x64xn
-    # Bspline fitting
-    dims,width,length,height = DVF.shape[1:]
-    phase_axis = np.arange(no_phase)
-    DVF_numpy = DVF.detach().cpu().numpy()
-    DVF_smooth = np.zeros_like(DVF_numpy)
+def img_norm(image):
+    """Apply the original image scaling operation without changing its formula."""
+    return image * np.array(1 / (np.max(image) - np.min(image)))
+
+
+def compute_cc(image_1, image_2):
+    """Compute the original global cross-correlation reference-frame score."""
+    mean_1, mean_2 = np.mean(image_1[:]), np.mean(image_2[:])
+    return np.mean((image_1 - mean_1) * (image_2 - mean_2)) / (
+        np.std(image_1[:]) * np.std(image_2[:])
+    )
+
+
+def smooth_dvf(dvf, phase_count):
+    """Apply the original phase-axis B-spline smoothing to every DVF component."""
+    dimensions, width, length, height = dvf.shape[1:]
+    phase_axis = np.arange(phase_count)
+    dvf_numpy = dvf.detach().cpu().numpy()
+    smoothed = np.zeros_like(dvf_numpy)
     for i in range(width):
         for j in range(length):
             for h in range(height):
-                for dim in range(dims):
-                    DVF_string = DVF_numpy[:,dim,i,j,h]
-                    t, c, k = interpolate.splrep(phase_axis, DVF_string, s=0.1, k=3)
-                    spline = interpolate.BSpline(t, c, k, extrapolate=False)
-                    DVF_smooth[:,dim,i,j,h] = spline(phase_axis)
-                    # N = 100
-                    # xmin, xmax = phase_axis.min(), phase_axis.max()
-                    # xx = np.linspace(xmin, xmax, N)
-                    # yy = spline(xx)
-                    # plt.plot(phase_axis, DVF_string, 'bo', label='Original points')
-                    # plt.plot(xx, spline(xx), 'r', label='BSpline')
-                    # plt.grid()
-                    # plt.legend(loc='best')
-                    # plt.show()
-    return DVF_smooth
+                for dimension in range(dimensions):
+                    knots, coefficients, degree = interpolate.splrep(
+                        phase_axis, dvf_numpy[:, dimension, i, j, h], s=0.1, k=3
+                    )
+                    spline = interpolate.BSpline(
+                        knots, coefficients, degree, extrapolate=False
+                    )
+                    smoothed[:, dimension, i, j, h] = spline(phase_axis)
+    return smoothed
 
-def Elastix(moving_image, fixed_image, path, mode="BSpline"):
-    import subprocess
-    import nibabel as nib
 
-    moving = {"max":np.max(moving_image), "min":np.min(moving_image)}
-    fixed = {"max":np.max(fixed_image), "min":np.min(fixed_image)}
-
-    moving_image = (moving_image - moving["min"])/(moving["max"] - moving["min"])
-    fixed_image = (fixed_image - fixed["min"])/(fixed["max"] - fixed["min"])
-
-    moving_image_out = sitk.GetImageFromArray(moving_image*255)
-    fixed_image_out = sitk.GetImageFromArray(fixed_image*255)
-        
-    sitk.WriteImage(moving_image_out,'./{}/moving_image.nii.gz'.format(path))
-    sitk.WriteImage(fixed_image_out,'./{}/fixed_image.nii.gz'.format(path))
-
-    if mode == "BSpline":
-    #    elastix_command = "elastix -f {} -m {} -p ./parameters_BSpline.txt -out {}".format("./{}/fixed_image.nii.gz".format(path), "./{}/moving_image.nii.gz".format(path), path)
-       elastix_command = "elastix -f {} -m {} -p ./Par0020bspline2-MI-lesswarp.txt -out {}".format("./{}/fixed_image.nii.gz".format(path), "./{}/moving_image.nii.gz".format(path), path)
-        
-        # parameter_path = os.path.join(os.getcwd(), 'parameters_BSpline.txt')
-    elif mode == "Affine":
-       elastix_command = "elastix -f {} -m {} -p ./parameters_Affine.txt -out {}".format("./{}/fixed_image.nii.gz".format(path), "./{}/moving_image.nii.gz".format(path), path)
-        # parameter_path = os.path.join(os.getcwd(), 'parameters_Rigid.txt')
-    elif mode == "Rigid":
-       elastix_command = "elastix -f {} -m {} -p ./parameters_Rigid.txt -out {}".format("./{}/fixed_image.nii.gz".format(path), "./{}/moving_image.nii.gz".format(path), path)
-        # parameter_path = os.path.join(os.getcwd(), 'parameters_Rigid.txt')
-
+def run_elastix(moving_image, fixed_image, path, mode="BSpline"):
+    """Run the existing Elastix command and restore the moving intensity range."""
+    moving_range = {"max": np.max(moving_image), "min": np.min(moving_image)}
+    fixed_range = {"max": np.max(fixed_image), "min": np.min(fixed_image)}
+    moving_normalized = (moving_image - moving_range["min"]) / (
+        moving_range["max"] - moving_range["min"]
+    )
+    fixed_normalized = (fixed_image - fixed_range["min"]) / (
+        fixed_range["max"] - fixed_range["min"]
+    )
+    os.makedirs(path, exist_ok=True)
+    moving_path = os.path.join(path, "moving_image.nii.gz")
+    fixed_path = os.path.join(path, "fixed_image.nii.gz")
+    sitk.WriteImage(sitk.GetImageFromArray(moving_normalized * 255), moving_path)
+    sitk.WriteImage(sitk.GetImageFromArray(fixed_normalized * 255), fixed_path)
+    parameter_files = {
+        "BSpline": "./Par0020bspline2-MI-lesswarp.txt",
+        "Affine": "./parameters_Affine.txt",
+        "Rigid": "./parameters_Rigid.txt",
+    }
+    if mode not in parameter_files:
+        raise ValueError(f"Unsupported Elastix mode: {mode}")
+    command = f"elastix -f {fixed_path} -m {moving_path} -p {parameter_files[mode]} -out {path}"
     try:
-       subprocess.run(elastix_command, shell=True, check=True)
-       print("Elastix runs successfully!")
-    except subprocess.CalledProcessError as e:
-       print("Elastix runs with error: ", e)
+        subprocess.run(command, shell=True, check=True)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"Elastix {mode} registration failed for output path {path}."
+        ) from exc
+    warped = torch.tensor(
+        np.squeeze(nib.load(os.path.join(path, "result.0.nii.gz")).dataobj)
+        .astype(float)
+        .transpose((2, 1, 0))
+    )
+    warped[warped < 0] = 0
+    warped = (warped - torch.min(warped)) / (torch.max(warped) - torch.min(warped))
+    return (
+        warped * (moving_range["max"] - moving_range["min"]) + moving_range["min"]
+    ).numpy()
 
-    warped = torch.tensor(np.squeeze(nib.load("./{}/result.0.nii.gz".format(path)).dataobj).astype(float).transpose((2,1,0)))
-    warped[warped<0] = 0
-    warped = (warped -  torch.min(warped)) / (torch.max(warped) - torch.min(warped))
 
-    return (warped * (moving["max"] - moving["min"]) + moving["min"]).numpy()
-        
-FourD = sio.loadmat(mat_path)['FourD_ave_save']
-T2 = sio.loadmat(mat_path)['T2_save']
+def load_models(coarse_path, fine_path, device):
+    """Build and load only the existing models required by enabled stages."""
+    device_vxm = "/CPU:0" if device == "cpu" else vxm.tf.utils.setup_device("0")[0]
+    coarse_model = fine_model = None
+    with tf.device(device_vxm):
+        if ENABLE_COARSE_ALIGNMENT:
+            coarse_model = vxm.networks.HyperVxmDense(
+                int_steps=5,
+                reg_field="warp",
+                inshape=COARSE_VOLUME_SIZE,
+                int_resolution=2,
+                svf_resolution=2,
+                nb_unet_features=([64] * 4, [64] * 6),
+            )
+        if ENABLE_FINE_ALIGNMENT:
+            fine_model = vxm.networks.HyperVxmDense(
+                int_steps=5,
+                reg_field="warp",
+                inshape=FINE_VOLUME_SIZE,
+                int_resolution=2,
+                svf_resolution=2,
+                nb_unet_features=([24] * 4, [24] * 6),
+            )
+        if ENABLE_COARSE_ALIGNMENT:
+            coarse_model = peilin.inspect_weight_loading(coarse_model, coarse_path)
+        if ENABLE_FINE_ALIGNMENT:
+            fine_model = peilin.inspect_weight_loading(fine_model, fine_path)
+    return coarse_model, fine_model
 
-peilin.plot_3DLiver(FourD[..., 0], name="FourD_raw", path = "./tmp_plot", min=0, max=1)
-peilin.plot_3DLiver(T2, name="T2_raw", path = "./tmp_plot", min=0, max=1)
 
-plt.imshow(T2[..., 40], cmap='gray', interpolation=None, aspect=None)
-plt.show()
-# Load T2 images
-T2_dicoms = glob.glob(os.path.join(T2_path, 'IM-*'))
-T2_files = []
-T2_x = np.array([])
-T2_y = np.array([])
-T2_z = np.array([])
-print('Loading T2w MRI...\n')
-count_num = 1
-for fname in T2_dicoms:
-    print("\rloading: %d/%d" % (count_num, len(T2_dicoms)), end=' ')
-    T2_files.append(pydicom.dcmread(os.path.join(T2_path,fname)))
-    T2_x = np.append(T2_x, T2_files[count_num-1].ImagePositionPatient[0])
-    T2_y = np.append(T2_y, T2_files[count_num-1].ImagePositionPatient[1])
-    T2_z = np.append(T2_z, T2_files[count_num-1].ImagePositionPatient[2])    
-    count_num = count_num + 1 
-print('\n')
+def load_inputs(base_path, mrn, study_date, image_name, reference_file):
+    """Load the preprocessed MAT volumes and original T2 DICOM metadata."""
+    patient_path = os.path.join(base_path, mrn, study_date)
+    t2_path = os.path.join(patient_path, image_name)
+    mat_data = sio.loadmat(os.path.join(patient_path, "phase_T2.mat"))
+    four_d, t2 = mat_data["FourD_ave_save"], mat_data["T2_save"]
+    header = pydicom.dcmread(os.path.join(t2_path, reference_file))
+    dicom_paths = glob.glob(os.path.join(t2_path, "IM-*"))
+    t2_files = [pydicom.dcmread(path) for path in dicom_paths]
+    positions = np.asarray([item.ImagePositionPatient for item in t2_files])
+    return (
+        four_d,
+        t2,
+        header,
+        t2_files,
+        positions,
+        os.path.join(patient_path, "UQ_4D_T2"),
+    )
 
-origsize_FourD = np.shape(FourD)[:3]
-FourD_num_frames = np.shape(FourD)[3]
 
-#Find the closest frame
-SSIM_T2 = np.zeros(FourD_num_frames)
-for frame_no in range(FourD_num_frames):
-    FourD_frame_np = FourD[:,:,:,frame_no]
-    SSIM_T2[frame_no] = compute_cc(FourD_frame_np, T2)
-    
-FourD_T2_frame = FourD[:,:,:,np.argmax(SSIM_T2)]
-print(f"Matched Frame is {np.argmax(SSIM_T2)}")
+def select_reference_frame(four_d, t2):
+    """Select the FourD phase with the original global CC rule."""
+    scores = np.asarray(
+        [compute_cc(four_d[..., frame], t2) for frame in range(four_d.shape[3])]
+    )
+    index = int(np.argmax(scores))
+    print(f"Matched Frame is {index}")
+    return four_d[..., index]
 
-#---------- Registration preparation ----------
-import os
-import scipy.io as sio
-import matplotlib.pyplot as plt
-import shutil
-# import oct2py
-# os.environ['OCTAVE_EXECUTABLE'] = shutil.which(r'C:\Users\S217615\AppData\Local\Programs\GNU Octave\Octave-6.4.0\mingw64\bin\octave-cli.exe')
-# oc = oct2py.Oct2Py()
-elastix_path = os.path.join(os.getcwd(), 'elastix-5.0.1-win64')
-matlab_elastix_path = os.path.join(os.getcwd(), 'matlab_elastix-master')
-octave_tablicious_path = os.path.join(os.getcwd(), 'octave-tablicious-master')
-yamlmatlab_path = os.path.join(os.getcwd(), 'yamlmatlab-master')
-addMfile_path = os.path.join(os.getcwd(), 'addMfile')
-temp_path_1 = os.path.join(os.getcwd(), 'temp_folder_1')
-temp_path_2 = os.path.join(os.getcwd(), 'temp_folder_2')
-parameter_path_0 = os.path.join(os.getcwd(), 'Par0020rigid.txt')
-parameter_path_1 = os.path.join(os.getcwd(), 'Par0020affine.txt')
-parameter_path_1_1 = os.path.join(os.getcwd(), 'Par0020affine - 2.txt')
-parameter_path_2 = os.path.join(os.getcwd(), 'Par0020bspline2 - MI.txt')
-parameter_path_3 = os.path.join(os.getcwd(), 'Par0020bspline2 - MI - 2.txt')
-parameter_path_4 = os.path.join(os.getcwd(), 'parameters_BSpline.txt')
 
-# oc.addpath(oc.genpath(elastix_path))
-# oc.addpath(oc.genpath(octave_tablicious_path))
-# oc.addpath(oc.genpath(matlab_elastix_path))
-# oc.addpath(oc.genpath(yamlmatlab_path))
-# oc.addpath(oc.genpath(addMfile_path))
+def run_initial_alignment(t2, reference_frame):
+    """Run independently switchable existing Rigid and BSpline Elastix stages."""
+    current = t2
+    if ENABLE_AFFINE_ALIGNMENT:
+        current = run_elastix(current, reference_frame, "temp_folder_1", "Rigid")
+        if ENABLE_QC_OUTPUTS:
+            peilin.plot_3DLiver(
+                current, name="T2_affine_warped", path="./tmp_plot", min=0, max=1
+            )
+    if ENABLE_BSPLINE_ALIGNMENT:
+        current = run_elastix(current, reference_frame, "temp_folder_2", "BSpline")
+    return current
 
-#---------- Register T2 to the selected frame----------
-os.makedirs(temp_path_1, exist_ok=True)
-os.makedirs(temp_path_2, exist_ok=True)
-T2_def_1 = Elastix(T2, FourD_T2_frame, "temp_folder_1", "Rigid")
-T2_def = Elastix(T2_def_1, FourD_T2_frame, "temp_folder_2", "BSpline")
-peilin.plot_3DLiver(T2, name="T2", path = "./tmp_plot", min=0, max=1)
-peilin.plot_3DLiver(FourD_T2_frame, name="4D_selected", path = "./tmp_plot", min=0, max=1)
-peilin.plot_3DLiver(T2_def_1, name="T2_affine_warped", path = "./tmp_plot", min=0, max=1)
-peilin.plot_3DLiver(T2_def, name="T2_warped", path = "./tmp_plot", min=0, max=1)
 
-slice_count = 0
+def prepare_registration(t2_aligned, reference_frame, device):
+    """Prepare tensors and the original-grid spatial transformer."""
+    t2_normalized = img_norm(t2_aligned)
+    original_size = t2_normalized.shape
+    transformer = SpatialTransformer(original_size).to(device)
+    t2_tensor = (
+        torch.from_numpy(
+            np.asarray(t2_normalized[np.newaxis, np.newaxis, ...], dtype=np.float32)
+        )
+        .to(device)
+        .float()
+    )
+    reference_normalized = img_norm(reference_frame)
+    reference_tensor = (
+        torch.from_numpy(
+            np.asarray(
+                reference_normalized[np.newaxis, np.newaxis, ...], dtype=np.float32
+            )
+        )
+        .to(device)
+        .float()
+    )
+    coarse_moving = F.interpolate(
+        reference_tensor, size=COARSE_VOLUME_SIZE, mode="trilinear"
+    )
+    return t2_tensor, original_size, transformer, coarse_moving
 
-## Deform 4D images - T2
-T2_crop = img_norm(T2_def)
-origsize_T2 = T2_crop.shape
-ST_orig_T2 = SpatialTransformer(origsize_T2)   
-ST_orig_T2.to(device)
-T2_crop = T2_crop[np.newaxis, np.newaxis, ...]
-T2_crop = np.array(T2_crop, dtype=np.float32)
-T2_crop = torch.from_numpy(T2_crop).to(device).float()
-input_T2 = F.interpolate(T2_crop, size = vol_size, mode='trilinear')
-FourD_T2_frame = img_norm(FourD_T2_frame)
-volmov_T2 = FourD_T2_frame[np.newaxis, np.newaxis, ...]
-volmov_T2 = np.array(volmov_T2, dtype=np.float32)
-volmov_T2 = torch.from_numpy(volmov_T2).to(device).float()
-input_mov_T2 = F.interpolate(volmov_T2, size = vol_size, mode='trilinear')
-series_number_base = int(np.random.randint(low = 1500, high = 3000, size = 1))
-end_dataloading = time.time()
-np.random.seed(int(time.time()))
-random_seeds = np.random.choice(10000, size = 10000, replace = False)
 
-rand_study = np.random.randint(10, size = 29)
-study_UID_suffix = str()
-for i in range(len(rand_study)):
-    study_UID_suffix += str(int(rand_study[i]))
-study_number = str(int(np.random.randint(low = 1500, high = 3000, size = 1)))
+def run_coarse_alignment(four_d, coarse_moving, model, original_size, device):
+    """Estimate every phase's coarse DVF with the existing model and inference call."""
+    collected = torch.zeros([four_d.shape[3], 3, *COARSE_VOLUME_SIZE]).to(device)
+    for frame in range(four_d.shape[3]):
+        fixed = (
+            torch.from_numpy(
+                np.asarray(
+                    img_norm(four_d[..., frame])[np.newaxis, np.newaxis, ...],
+                    dtype=np.float32,
+                )
+            )
+            .to(device)
+            .float()
+        )
+        input_fixed = F.interpolate(fixed, size=COARSE_VOLUME_SIZE, mode="trilinear")
+        if ENABLE_QC_OUTPUTS:
+            peilin.plot_3DLiver(
+                coarse_moving.squeeze().cpu().numpy(),
+                name=f"tmp{frame}",
+                path="./tmp_plot",
+                min=0,
+                max=1,
+            )
+        with torch.no_grad():
+            flow = peilin.inference_HyperMorph(
+                coarse_moving.cpu(), input_fixed.cpu(), model, f"frame_{frame}"
+            )
+        if ENABLE_QC_OUTPUTS:
+            for dimension in range(3):
+                peilin.plot_3DLiver(
+                    flow.squeeze()[dimension].detach().cpu().numpy(),
+                    name=f"tmp_dvf_{dimension + 1}dim_{frame}",
+                    path="./tmp_plot",
+                    min=0,
+                    max=1,
+                )
+        collected[frame] = flow * AMPLIFIER
+    return collected
 
-rand_frame = np.random.randint(10, size = 29)
-frame_UID_suffix = str()
-for i in range(len(rand_frame)):
-    frame_UID_suffix += str(int(rand_frame[i]))
 
-DVF_collect = torch.zeros([FourD.shape[3],3,*vol_size]).to(device)
-for frame in range(FourD.shape[3]):
+def warp_with_coarse_flow(t2_tensor, transformer, flow, original_size, device):
+    """Warp T2 with one coarse flow on the original spatial grid."""
+    return transformer(t2_tensor, dvf_interp(flow, original_size).to(device))
 
-    if frame > frame_limit:
-        break
-    volfix = FourD[:,:,:,frame]
-    volfix = img_norm(volfix)
-    volfix = volfix[np.newaxis,np.newaxis,...]
-    volfix = np.array(volfix, dtype = np.float32)
-    volfix = torch.from_numpy(volfix).to(device).float()
-    input_fix = F.interpolate(volfix, size = vol_size, mode='trilinear')
-    input_diff = input_mov_T2 - input_fix
 
-    peilin.plot_3DLiver(input_mov_T2.squeeze().cpu().numpy(), name="tmp{}".format(frame), path = "./tmp_plot", min=0, max=1)
-    with torch.no_grad():
-        flow_up = peilin.inference_HyperMorph(input_mov_T2.cpu(), input_fix.cpu(), model, f"frame_{frame}")
+def run_fine_alignment(
+    coarse_warped, fixed, model, transformer, original_size, device, frame
+):
+    """Apply the existing fine HyperMorph inference to the current phase."""
+    input_fixed = F.interpolate(fixed, size=FINE_VOLUME_SIZE, mode="trilinear")
+    input_moving = F.interpolate(coarse_warped, size=FINE_VOLUME_SIZE, mode="trilinear")
+    flow = peilin.inference_HyperMorph(
+        input_moving.cpu(), input_fixed.cpu(), model, f"frame_{frame}_2"
+    )
+    return transformer(coarse_warped, dvf_interp(flow, original_size).to(device))
 
-        peilin.plot_3DLiver(flow_up.squeeze()[0].detach().cpu().numpy(), name="tmp_dvf_1dim_{}".format(frame), path = "./tmp_plot", min=0, max=1)
-        peilin.plot_3DLiver(flow_up.squeeze()[1].detach().cpu().numpy(), name="tmp_dvf_2dim_{}".format(frame), path = "./tmp_plot", min=0, max=1)
-        peilin.plot_3DLiver(flow_up.squeeze()[2].detach().cpu().numpy(), name="tmp_dvf_3dim_{}".format(frame), path = "./tmp_plot", min=0, max=1)
-        flow_orig = dvf_interp(flow_up, origsize_T2)
-    DVF_collect[frame, :, :, :, :] = flow_up * amplifier
 
-DVF_smoothed = DVF_smooth(DVF_collect, FourD.shape[3])
+def initialize_dicom_identifiers():
+    """Generate the original random DICOM identifier components in the original order."""
+    series_number_base = int(np.random.randint(low=1500, high=3000, size=1))
+    np.random.seed(int(time.time()))
+    random_seeds = np.random.choice(10000, size=10000, replace=False)
+    np.random.randint(10, size=29)  # Preserve the original random-number call order.
+    study_number = str(int(np.random.randint(low=1500, high=3000, size=1)))
+    frame_suffix = "".join(str(int(value)) for value in np.random.randint(10, size=29))
+    return series_number_base, random_seeds, study_number, frame_suffix
 
-for frame in range(FourD.shape[3]):
-    flow_smooth = torch.unsqueeze(torch.from_numpy(DVF_smoothed[frame,:,:,:,:]),0).to(device) 
-    flow_orig = dvf_interp(flow_smooth, origsize_T2)
-    T2_interp_dvf_ = ST_orig_T2(T2_crop, flow_orig)
 
-    #Second Term
-    input_fix_2 = F.interpolate(volfix, size = vol_size_2, mode='trilinear')
-    input_moving_2 = F.interpolate(T2_interp_dvf_, size = vol_size_2, mode='trilinear')
-    flow_up = peilin.inference_HyperMorph(input_moving_2.cpu(), input_fix_2.cpu(), model_2, f"frame_{frame}_2")
-    flow_orig = dvf_interp(flow_up, origsize_T2)
-    T2_interp_dvf = ST_orig_T2(T2_interp_dvf_, flow_orig.to(device))
-
-    volfix = FourD[:,:,:,frame]
-    volfix = img_norm(volfix)
-    volfix = volfix[np.newaxis,np.newaxis,...]
-    volfix = np.array(volfix, dtype = np.float32)
-    volfix = torch.from_numpy(volfix).to(device).float()
-    FourD_np = F.interpolate(volfix, origsize_T2).cpu().numpy()[0,0,:]
-    T2_FourD_np = T2_interp_dvf[0,0,:].cpu().numpy()
-    n1=HKU_header.PixelSpacing[0]
-    n2=HKU_header.PixelSpacing[1]
-    n3=HKU_header.SliceThickness
-    T2_FourD_np_restored = F.interpolate(T2_interp_dvf, list([int(tmp) for tmp in np.int16(np.array(T2_def.shape)/[n1,n2,n3])]))[0,0,:].cpu().numpy()
-    mat_name = Output_path + '/UQ_T2_' + str(frame) + '.mat'
-    mat_var_name_T2 = 'UQ_T2_' + str(frame)
-    mat_var_name_4D = 'FourD_' + str(frame)
-    sio.savemat(mat_name,{mat_var_name_T2:T2_FourD_np, mat_var_name_4D:FourD_np})
-
-    peilin.plot_3DLiver(T2_def, name="T2_def_{}".format(frame), path = "./tmp_plot", min=0, max=FourD_np.max(), titles = ["Coronal Plane", "Sagittal Plane", "Axial Plance"])
-    peilin.plot_3DLiver(T2_crop.detach().to("cpu").numpy()[0,0], name="T2_crop_{}".format(frame), path = "./tmp_plot", min=0, max=FourD_np.max(), titles = ["Coronal Plane", "Sagittal Plane", "Axial Plance"])
-    peilin.plot_3DLiver(T2_FourD_np, name="UQ4D_{}".format(frame), path = "./tmp_plot", min=0, max=T2_FourD_np.max(), titles = ["Coronal Plane", "Sagittal Plane", "Axial Plance"])
-    peilin.plot_3DLiver(FourD_np, name="LQ4D_{}".format(frame), path = "./tmp_plot", min=0, max=FourD_np.max(), titles = ["Coronal Plane", "Sagittal Plane", "Axial Plance"])
-#---------- Write to Dicom ----------
-### Use T2 coordinate and information
-    np.random.seed(int(start)+slice_count) # Problem. It will make all the image with the same frame number get the same UID.
+def export_dicom_volume(
+    volume,
+    frame,
+    prefix,
+    description,
+    header,
+    t2_files,
+    positions,
+    output_path,
+    identifiers,
+    start,
+    slice_count,
+    clamp_negative,
+):
+    """Write one volume with the original T2-derived DICOM metadata and scaling."""
+    series_number_base, random_seeds, study_number, frame_suffix = identifiers
+    np.random.seed(int(start) + slice_count)
     time.sleep(1)
-    rand_series = np.random.randint(10, size = 29)
-    series_UID_suffix = str()
-    for i in range(len(rand_series)):
-        series_UID_suffix += str(int(rand_series[i]))
+    series_suffix = "".join(str(int(value)) for value in np.random.randint(10, size=29))
     series_number = pydicom.valuerep.IS(series_number_base + frame)
-    # for slice_index in range(min(T2_FourD_np_restored.shape[2]-1, len(T2_files)-1)):
-    for slice_index in range(min(T2_FourD_np_restored.shape[2], len(T2_files))):
-    # for slice_index in range(len(T2_files)):
-        # if slice_index <= pad-1:
-        #     continue
-        # slice_index = slice_index - pad
-        dicom_header = T2_files[-slice_index]
-        SeriesInstanceUID = pydicom.uid.UID(dicom_header.SeriesInstanceUID[:27] + series_UID_suffix)
+    for slice_index in range(min(volume.shape[2], len(t2_files))):
+        dicom_header = t2_files[-slice_index]
+        series_uid = pydicom.uid.UID(
+            dicom_header.SeriesInstanceUID[:27] + series_suffix
+        )
         np.random.seed(int(time.time() + random_seeds[slice_count]))
-        rand_instance = np.random.randint(10, size = 29)
-        instance_UID_suffix = str()
-        for i in range(len(rand_instance)):
-            instance_UID_suffix += str(int(rand_instance[i]))
-        SOPInstanceUID = pydicom.uid.UID(dicom_header.SOPInstanceUID[:27] + str(frame) + str(slice_index) + instance_UID_suffix[:-len(str(frame) + str(slice_index))])
-        StudyInstanceUID = pydicom.uid.UID(dicom_header.StudyInstanceUID[:27] + study_UID_suffix)
-        FrameOfReferenceUID = pydicom.uid.UID(dicom_header.FrameOfReferenceUID[:27] + frame_UID_suffix)
-### Change dicom file
-        HKU_header.PatientName = patient_name
-        HKU_header.PatientID = patient_id
-        T2_FourD_np_restored[T2_FourD_np_restored<0] = 0
-        HKU_header.PixelData = np.uint16(T2_FourD_np_restored[:,:,-slice_index]*500).tobytes() # float? int?
-        HKU_header.SOPInstanceUID = SOPInstanceUID
-        HKU_header.FrameOfReferenceUID = FrameOfReferenceUID
-        HKU_header.SeriesInstanceUID = SeriesInstanceUID
-        HKU_header.SeriesNumber = series_number
-        HKU_header.StudyID = study_number
-        HKU_header.Rows = T2_FourD_np_restored.shape[0]
-        HKU_header.Columns = T2_FourD_np_restored.shape[1]
-        HKU_header.SliceThickness = dicom_header.SliceThickness
-        HKU_header.SpacingBetweenSlices = dicom_header.SliceThickness #5.02 dicom_header.SpacingBetweenSlices
-        HKU_header.ImagePositionPatient = [np.min(T2_x), np.min(T2_y), np.max(T2_z)-slice_index*dicom_header.SliceThickness]
-        HKU_header.ImageOrientationPatient = dicom_header.ImageOrientationPatient
-        HKU_header.PixelSpacing = dicom_header.PixelSpacing
-        HKU_header.InstanceNumber = dicom_header.InstanceNumber
-        HKU_header.SliceLocation = np.max(T2_z)-slice_index*dicom_header.SliceThickness
-        HKU_header.SeriesDescription = 'UQ-T2w 4D-MRI frame ' + str(frame) 
-        
-        file_name = Output_path + '/T2w_frame' + str(frame) + '_' + str(slice_index) + '.dcm'
-        HKU_header.save_as(file_name)
-        slice_count = slice_count + 1
-    print('UQ-T2w 4D-MRI Frame %d generated. \n' %(frame))
-    time.sleep(1)
+        instance_suffix = "".join(
+            str(int(value)) for value in np.random.randint(10, size=29)
+        )
+        suffix_length = len(str(frame) + str(slice_index))
+        sop_uid = pydicom.uid.UID(
+            dicom_header.SOPInstanceUID[:27]
+            + str(frame)
+            + str(slice_index)
+            + instance_suffix[:-suffix_length]
+        )
+        frame_uid = pydicom.uid.UID(
+            dicom_header.FrameOfReferenceUID[:27] + frame_suffix
+        )
+        header.PatientName = header.PatientID
+        if clamp_negative:
+            volume[volume < 0] = 0
+        header.PixelData = np.uint16(volume[:, :, -slice_index] * 500).tobytes()
+        header.SOPInstanceUID = sop_uid
+        header.FrameOfReferenceUID = frame_uid
+        header.SeriesInstanceUID = series_uid
+        header.SeriesNumber = series_number
+        header.StudyID = study_number
+        header.Rows, header.Columns = volume.shape[:2]
+        header.SliceThickness = dicom_header.SliceThickness
+        header.SpacingBetweenSlices = dicom_header.SliceThickness
+        header.ImagePositionPatient = [
+            positions[:, 0].min(),
+            positions[:, 1].min(),
+            positions[:, 2].max() - slice_index * dicom_header.SliceThickness,
+        ]
+        header.ImageOrientationPatient = dicom_header.ImageOrientationPatient
+        header.PixelSpacing = dicom_header.PixelSpacing
+        header.InstanceNumber = dicom_header.InstanceNumber
+        header.SliceLocation = (
+            positions[:, 2].max() - slice_index * dicom_header.SliceThickness
+        )
+        header.SeriesDescription = f"{description} frame {frame}"
+        header.save_as(os.path.join(output_path, f"{prefix}{frame}_{slice_index}.dcm"))
+        slice_count += 1
+    return slice_count
 
-for frame in range(FourD.shape[3]):
-    volfix = FourD[:,:,:,frame]
-    volfix = img_norm(volfix)
-    volfix = volfix[np.newaxis,np.newaxis,...]
-    volfix = np.array(volfix, dtype = np.float32)
-    volfix = torch.from_numpy(volfix).to(device).float().cpu()
-    # FourD_np = F.interpolate(volfix, origsize_T2).cpu().numpy()[0,0,:]
-    n1=HKU_header.PixelSpacing[0]
-    n2=HKU_header.PixelSpacing[1]
-    n3=HKU_header.SliceThickness
-    FourD_np_restored = F.interpolate(volfix, list([int(tmp) for tmp in np.int16(np.array(T2_def.shape)/[n1,n2,n3])]))[0,0,:].cpu().numpy()
 
-#---------- Write to Dicom ----------
-### Use T2 coordinate and information
-    np.random.seed(int(start)+slice_count) # Problem. It will make all the image with the same frame number get the same UID.
-    time.sleep(1)
-    rand_series = np.random.randint(10, size = 29)
-    series_UID_suffix = str()
-    for i in range(len(rand_series)):
-        series_UID_suffix += str(int(rand_series[i]))
-    series_number = pydicom.valuerep.IS(series_number_base + frame)
-    # for slice_index in range(FourD_np_restored.shape[2]):
-    # for slice_index in range(len(T2_files)):
-    for slice_index in range(min(T2_FourD_np_restored.shape[2], len(T2_files))):
-        # if slice_index <= pad-1:
-        #     continue
-        # slice_index = slice_index - paddouzhemedale 
-        dicom_header = T2_files[-slice_index]
-        SeriesInstanceUID = pydicom.uid.UID(dicom_header.SeriesInstanceUID[:27] + series_UID_suffix)
-        np.random.seed(int(time.time() + random_seeds[slice_count]))
-        rand_instance = np.random.randint(10, size = 29)
-        instance_UID_suffix = str()
-        for i in range(len(rand_instance)):
-            instance_UID_suffix += str(int(rand_instance[i]))
-        SOPInstanceUID = pydicom.uid.UID(dicom_header.SOPInstanceUID[:27] + str(frame) + str(slice_index) + instance_UID_suffix[:-len(str(frame) + str(slice_index))])
-        StudyInstanceUID = pydicom.uid.UID(dicom_header.StudyInstanceUID[:27] + study_UID_suffix)
-        FrameOfReferenceUID = pydicom.uid.UID(dicom_header.FrameOfReferenceUID[:27] + frame_UID_suffix)
-### Change dicom file
-        HKU_header.PatientName = patient_name
-        HKU_header.PatientID = patient_id
-        # T2_FourD_np_restored[T2_FourD_np_restored<0] = 0
-        HKU_header.PixelData = np.uint16(FourD_np_restored[:,:,-slice_index]*500).tobytes() # float? int?
-        HKU_header.SOPInstanceUID = SOPInstanceUID
-        HKU_header.FrameOfReferenceUID = FrameOfReferenceUID
-        HKU_header.SeriesInstanceUID = SeriesInstanceUID
-        HKU_header.SeriesNumber = series_number
-        HKU_header.StudyID = study_number
-        HKU_header.Rows = FourD_np_restored.shape[0]
-        HKU_header.Columns = FourD_np_restored.shape[1]
-        HKU_header.SliceThickness = dicom_header.SliceThickness
-        HKU_header.SpacingBetweenSlices = dicom_header.SliceThickness #5.02 dicom_header.SpacingBetweenSlices
-        HKU_header.ImagePositionPatient = [np.min(T2_x), np.min(T2_y), np.max(T2_z)-slice_index*dicom_header.SliceThickness]
-        HKU_header.ImageOrientationPatient = dicom_header.ImageOrientationPatient
-        HKU_header.PixelSpacing = dicom_header.PixelSpacing
-        HKU_header.InstanceNumber = dicom_header.InstanceNumber
-        HKU_header.SliceLocation = np.max(T2_z)-slice_index*dicom_header.SliceThickness
-        HKU_header.SeriesDescription = 'LQ-T2w 4D-MRI frame ' + str(frame) 
-        # dicom_header.FrameOfReferenceUID = FrameOfReferenceUID
-        # dicom_header.FrameOfReferenceUID = FrameOfReferenceUID
-        # dicom_header.SeriesInstanceUID = SeriesInstanceUID
-        # dicom_header.SeriesNumber = series_number
-        # dicom_header.StudyInstanceUID = StudyInstanceUID
-        # dicom_header.StudyID = study_number
-        # dicom_header.PixelData = np.uint16(T1_FourD_np_restored[:,:,slice_index]*1000).tobytes() # float? int?
-        file_name = Output_path + '/LQ_T2w_frame' + str(frame) + '_' + str(slice_index) + '.dcm'
-        HKU_header.save_as(file_name)
-        slice_count = slice_count + 1
-    print('LQ-T2w 4D-MRI Frame %d generated. \n' %(frame))
-    time.sleep(1)
+def reconstruct_phases(
+    four_d,
+    t2_aligned,
+    reference_frame,
+    header,
+    t2_files,
+    positions,
+    output_path,
+    coarse_model,
+    fine_model,
+    device,
+    start,
+):
+    """Run coarse/smoothing/fine stages and save UQ results for every phase."""
+    os.makedirs(output_path, exist_ok=True)
+    t2_tensor, original_size, transformer, coarse_moving = prepare_registration(
+        t2_aligned, reference_frame, device
+    )
+    identifiers = initialize_dicom_identifiers()
+    slice_count = 0
+    if ENABLE_COARSE_ALIGNMENT:
+        collected = run_coarse_alignment(
+            four_d, coarse_moving, coarse_model, original_size, device
+        )
+        flows = (
+            smooth_dvf(collected, four_d.shape[3])
+            if ENABLE_DVF_SMOOTHING
+            else collected.detach().cpu().numpy()
+        )
+
+    for frame in range(four_d.shape[3]):
+        fixed = (
+            torch.from_numpy(
+                np.asarray(
+                    img_norm(four_d[..., frame])[np.newaxis, np.newaxis, ...],
+                    dtype=np.float32,
+                )
+            )
+            .to(device)
+            .float()
+        )
+        current = t2_tensor
+        if ENABLE_COARSE_ALIGNMENT:
+            flow = torch.unsqueeze(torch.from_numpy(flows[frame]), 0).to(device)
+            current = warp_with_coarse_flow(
+                t2_tensor, transformer, flow, original_size, device
+            )
+        if ENABLE_FINE_ALIGNMENT:
+            current = run_fine_alignment(
+                current, fixed, fine_model, transformer, original_size, device, frame
+            )
+
+        four_d_np = F.interpolate(fixed, original_size).cpu().numpy()[0, 0, :]
+        uq_np = current[0, 0, :].detach().cpu().numpy()
+        spacing = [
+            header.PixelSpacing[0],
+            header.PixelSpacing[1],
+            header.SliceThickness,
+        ]
+        restored_size = [
+            int(value) for value in np.int16(np.array(t2_aligned.shape) / spacing)
+        ]
+        uq_restored = (
+            F.interpolate(current, restored_size)[0, 0, :].detach().cpu().numpy()
+        )
+        if ENABLE_INTERMEDIATE_OUTPUTS:
+            sio.savemat(
+                os.path.join(output_path, f"UQ_T2_{frame}.mat"),
+                {f"UQ_T2_{frame}": uq_np, f"FourD_{frame}": four_d_np},
+            )
+        if ENABLE_QC_OUTPUTS:
+            peilin.plot_3DLiver(
+                t2_aligned,
+                name=f"T2_def_{frame}",
+                path="./tmp_plot",
+                min=0,
+                max=four_d_np.max(),
+            )
+            peilin.plot_3DLiver(
+                t2_tensor.detach().cpu().numpy()[0, 0],
+                name=f"T2_crop_{frame}",
+                path="./tmp_plot",
+                min=0,
+                max=four_d_np.max(),
+            )
+            peilin.plot_3DLiver(
+                uq_np, name=f"UQ4D_{frame}", path="./tmp_plot", min=0, max=uq_np.max()
+            )
+            peilin.plot_3DLiver(
+                four_d_np,
+                name=f"LQ4D_{frame}",
+                path="./tmp_plot",
+                min=0,
+                max=four_d_np.max(),
+            )
+        if ENABLE_UQ_DICOM_EXPORT:
+            slice_count = export_dicom_volume(
+                uq_restored,
+                frame,
+                "T2w_frame",
+                "UQ-T2w 4D-MRI",
+                header,
+                t2_files,
+                positions,
+                output_path,
+                identifiers,
+                start,
+                slice_count,
+                clamp_negative=True,
+            )
+            time.sleep(1)
+
+    if ENABLE_LQ_DICOM_EXPORT:
+        for frame in range(four_d.shape[3]):
+            fixed = (
+                torch.from_numpy(
+                    np.asarray(
+                        img_norm(four_d[..., frame])[np.newaxis, np.newaxis, ...],
+                        dtype=np.float32,
+                    )
+                )
+                .float()
+                .cpu()
+            )
+            spacing = [
+                header.PixelSpacing[0],
+                header.PixelSpacing[1],
+                header.SliceThickness,
+            ]
+            restored_size = [
+                int(value) for value in np.int16(np.array(t2_aligned.shape) / spacing)
+            ]
+            restored = F.interpolate(fixed, restored_size)[0, 0, :].cpu().numpy()
+            slice_count = export_dicom_volume(
+                restored,
+                frame,
+                "LQ_T2w_frame",
+                "LQ-T2w 4D-MRI",
+                header,
+                t2_files,
+                positions,
+                output_path,
+                identifiers,
+                start,
+                slice_count,
+                clamp_negative=False,
+            )
+            time.sleep(1)
+
+
+def main(args=None):
+    """Run the modular reconstruction pipeline with original defaults."""
+    arg = build_argument_parser().parse_args(args)
+    device = os.environ.get("FREETUNE4D_DEVICE", "cuda:0")
+    if device not in {"cpu", "cuda:0"}:
+        raise ValueError(f"Unsupported FREETUNE4D_DEVICE: {device}")
+    start = time.time()
+    coarse_model, fine_model = load_models(
+        arg.net_path_coarse, arg.net_path_fine, device
+    )
+    four_d, t2, header, t2_files, positions, output_path = load_inputs(
+        arg.base_path, arg.MR_number, arg.st_date, arg.name_3d, arg.reference_file
+    )
+    header.PatientName = arg.MR_number
+    header.PatientID = arg.MR_number
+    reference = select_reference_frame(four_d, t2)
+    aligned_t2 = run_initial_alignment(t2, reference)
+    if ENABLE_QC_OUTPUTS:
+        peilin.plot_3DLiver(
+            four_d[..., 0], name="FourD_raw", path="./tmp_plot", min=0, max=1
+        )
+        peilin.plot_3DLiver(t2, name="T2_raw", path="./tmp_plot", min=0, max=1)
+        peilin.plot_3DLiver(t2, name="T2", path="./tmp_plot", min=0, max=1)
+        peilin.plot_3DLiver(
+            reference, name="4D_selected", path="./tmp_plot", min=0, max=1
+        )
+        peilin.plot_3DLiver(
+            aligned_t2, name="T2_warped", path="./tmp_plot", min=0, max=1
+        )
+    reconstruct_phases(
+        four_d,
+        aligned_t2,
+        reference,
+        header,
+        t2_files,
+        positions,
+        output_path,
+        coarse_model,
+        fine_model,
+        device,
+        start,
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,17 +1,188 @@
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import math
 import warnings
 import pystrum.pynd.ndutils as nd
 
+
+MIND_SSC_CHANNEL_ORDER = (6, 8, 1, 11, 2, 10, 0, 7, 9, 4, 5, 3)
+
+
+def _as_single_channel_3d_tensor(image, device=None):
+    """Return a 3D image as a floating tensor shaped ``[B, 1, D, H, W]``."""
+    tensor = image if torch.is_tensor(image) else torch.as_tensor(image)
+    if tensor.ndim == 3:
+        tensor = tensor[None, None, ...]
+    elif tensor.ndim == 4:
+        tensor = tensor[:, None, ...]
+    elif tensor.ndim != 5 or tensor.shape[1] != 1:
+        raise ValueError(
+            "MIND-SSC expects [D, H, W], [B, D, H, W], or [B, 1, D, H, W] input."
+        )
+    if not tensor.is_floating_point():
+        tensor = tensor.float()
+    elif tensor.dtype not in (torch.float32, torch.float64):
+        tensor = tensor.float()
+    if device is not None:
+        tensor = tensor.to(device)
+    return tensor
+
+
+def _mind_ssc_shift_kernels(device, dtype):
+    """Build the 12 standard 3D MIND-SSC shift-kernel pairs."""
+    neighbourhood = torch.tensor(
+        [
+            [0, 1, 1],
+            [1, 1, 0],
+            [1, 0, 1],
+            [1, 1, 2],
+            [2, 1, 1],
+            [1, 2, 1],
+        ],
+        device=device,
+    )
+    squared_distances = torch.sum(
+        (neighbourhood[:, None, :] - neighbourhood[None, :, :]) ** 2,
+        dim=2,
+    )
+    first, second = torch.where(
+        (squared_distances == 2)
+        & (
+            torch.arange(6, device=device)[:, None]
+            > torch.arange(6, device=device)[None, :]
+        )
+    )
+    if first.numel() != 12:
+        raise RuntimeError(
+            f"MIND-SSC requires 12 neighbourhood pairs; got {first.numel()}."
+        )
+
+    kernel_1 = torch.zeros((12, 1, 3, 3, 3), device=device, dtype=dtype)
+    kernel_2 = torch.zeros_like(kernel_1)
+    pair_indices = torch.arange(12, device=device)
+    kernel_1[
+        pair_indices,
+        0,
+        neighbourhood[first, 0],
+        neighbourhood[first, 1],
+        neighbourhood[first, 2],
+    ] = 1
+    kernel_2[
+        pair_indices,
+        0,
+        neighbourhood[second, 0],
+        neighbourhood[second, 1],
+        neighbourhood[second, 2],
+    ] = 1
+    return kernel_1, kernel_2
+
+
+def mind_ssc_descriptor(image, radius=2, dilation=2):
+    """Compute the standard 12-channel 3D MIND-SSC descriptor.
+
+    The returned tensor has shape ``[B, 12, D, H, W]``. Replication padding
+    preserves the input spatial grid at both the shift and patch-aggregation
+    stages.
+    """
+    if radius < 0:
+        raise ValueError("MIND-SSC radius must be non-negative.")
+    if dilation < 1:
+        raise ValueError("MIND-SSC dilation must be at least 1.")
+
+    image = _as_single_channel_3d_tensor(image)
+    kernel_1, kernel_2 = _mind_ssc_shift_kernels(image.device, image.dtype)
+    shifted_input = F.pad(image, (dilation,) * 6, mode="replicate")
+    shifted_1 = F.conv3d(shifted_input, kernel_1, dilation=dilation)
+    shifted_2 = F.conv3d(shifted_input, kernel_2, dilation=dilation)
+    squared_difference = (shifted_1 - shifted_2) ** 2
+
+    if radius:
+        squared_difference = F.avg_pool3d(
+            F.pad(squared_difference, (radius,) * 6, mode="replicate"),
+            kernel_size=2 * radius + 1,
+            stride=1,
+        )
+
+    descriptor = squared_difference - squared_difference.min(dim=1, keepdim=True).values
+    local_variance = descriptor.mean(dim=1, keepdim=True)
+    mean_variance = local_variance.mean()
+    epsilon = torch.finfo(image.dtype).eps
+    stable_mean = torch.clamp(mean_variance, min=epsilon)
+    local_variance = torch.clamp(
+        local_variance,
+        min=stable_mean * 0.001,
+        max=stable_mean * 1000,
+    )
+    descriptor = torch.exp(-descriptor / local_variance)
+    descriptor = descriptor[:, MIND_SSC_CHANNEL_ORDER, ...]
+
+    if descriptor.shape[1] != 12 or descriptor.shape[2:] != image.shape[2:]:
+        raise RuntimeError(
+            f"Unexpected MIND-SSC descriptor shape: {tuple(descriptor.shape)}."
+        )
+    if not torch.isfinite(descriptor).all():
+        raise RuntimeError("MIND-SSC produced NaN or Inf values.")
+    return descriptor
+
+
+def compute_mind_ssc_distance(
+    fixed, moving, radius=2, dilation=2, mask=None, device=None
+):
+    """Return mean squared MIND-SSC descriptor distance (lower is better)."""
+    fixed_tensor = _as_single_channel_3d_tensor(fixed, device=device)
+    moving_tensor = _as_single_channel_3d_tensor(moving, device=device)
+    if fixed_tensor.shape != moving_tensor.shape:
+        raise ValueError(
+            "MIND-SSC requires fixed and moving images on the same spatial grid."
+        )
+
+    with torch.no_grad():
+        difference = (
+            mind_ssc_descriptor(fixed_tensor, radius=radius, dilation=dilation)
+            - mind_ssc_descriptor(moving_tensor, radius=radius, dilation=dilation)
+        ) ** 2
+        if mask is None:
+            return difference.mean()
+
+        mask_tensor = _as_single_channel_3d_tensor(
+            mask, device=fixed_tensor.device
+        ).bool()
+        if mask_tensor.shape != fixed_tensor.shape:
+            raise ValueError(
+                "MIND-SSC mask must use the same spatial grid as fixed and moving images."
+            )
+        expanded_mask = mask_tensor.expand(-1, difference.shape[1], -1, -1, -1)
+        if not expanded_mask.any():
+            raise ValueError("MIND-SSC mask must contain at least one valid voxel.")
+        return difference[expanded_mask].mean()
+
+
+class MINDSSC:
+    """3D MIND-SSC descriptor distance metric; lower values are better."""
+
+    def __init__(self, device="cpu", radius=2, dilation=2):
+        self.device = device
+        self.radius = radius
+        self.dilation = dilation
+
+    def loss(self, fixed, moving, mask=None):
+        return compute_mind_ssc_distance(
+            fixed,
+            moving,
+            radius=self.radius,
+            dilation=self.dilation,
+            mask=mask,
+            device=self.device,
+        )
+
+
 class NCC:
     """
     Local (over window) normalized cross correlation loss.
     """
 
-    def __init__(self, device='cpu', win=None):
+    def __init__(self, device="cpu", win=None):
         self.win = win
         self.device = device
 
@@ -23,7 +194,9 @@ class NCC:
         # get dimension of volume
         # assumes Ii, Ji are sized [batch_size, *vol_shape, nb_feats]
         ndims = len(list(Ii.size())) - 2
-        assert ndims in [1, 2, 3], "volumes should be 1 to 3 dimensions. found: %d" % ndims
+        assert ndims in [1, 2, 3], (
+            "volumes should be 1 to 3 dimensions. found: %d" % ndims
+        )
 
         # set window size
         win = [9] * ndims if self.win is None else self.win
@@ -34,8 +207,8 @@ class NCC:
         pad_no = math.floor(win[0] / 2)
 
         if ndims == 1:
-            stride = (1)
-            padding = (pad_no)
+            stride = 1
+            padding = pad_no
         elif ndims == 2:
             stride = (1, 1)
             padding = (pad_no, pad_no)
@@ -44,7 +217,7 @@ class NCC:
             padding = (pad_no, pad_no, pad_no)
 
         # get convolution function
-        conv_fn = getattr(F, 'conv%dd' % ndims)
+        conv_fn = getattr(F, "conv%dd" % ndims)
 
         # compute CC squares
         I2 = Ii * Ii
@@ -69,6 +242,7 @@ class NCC:
 
         return -torch.mean(cc, dim=[i for i in range(1, len(cc.shape))])
 
+
 class MSE:
     """
     Mean squared error loss.
@@ -77,6 +251,7 @@ class MSE:
     def loss(self, y_true, y_pred):
         # print("MSE Loss: ", torch.max(y_true), torch.min(y_true), torch.max(y_pred), torch.min(y_pred))
         return torch.mean((y_true - y_pred) ** 2)
+
 
 class Dice:
     def loss(self, y_true, y_pred, labels=None, include_zero=False):
@@ -87,8 +262,8 @@ class Dice:
             labels = np.concatenate([np.unique(a) for a in [y_true, y_pred]])
             labels = np.sort(np.unique(labels))
         if not include_zero:
-            labels = np.delete(labels, np.argwhere(labels == 0)) 
-    
+            labels = np.delete(labels, np.argwhere(labels == 0))
+
         dicem = np.zeros(len(labels))
         for idx, label in enumerate(labels):
             top = 2 * np.sum(np.logical_and(y_true == label, y_pred == label))
@@ -97,12 +272,13 @@ class Dice:
             dicem[idx] = top / bottom
         return np.mean(dicem)
 
+
 class Grad:
     """
     N-D gradient loss.
     """
 
-    def __init__(self, penalty='l1', loss_mult=None):
+    def __init__(self, penalty="l1", loss_mult=None):
         self.penalty = penalty
         self.loss_mult = loss_mult
 
@@ -118,16 +294,23 @@ class Grad:
             y = y.permute(r)
             dfi = y[1:, ...] - y[:-1, ...]
 
-            r = [*range(d - 1, d + 1), *reversed(range(1, d - 1)), 0, *range(d + 1, ndims + 2)]
+            r = [
+                *range(d - 1, d + 1),
+                *reversed(range(1, d - 1)),
+                0,
+                *range(d + 1, ndims + 2),
+            ]
             df[i] = dfi.permute(r)
 
         return df
 
     def loss(self, _, y_pred):
-        if self.penalty == 'l1':
+        if self.penalty == "l1":
             dif = [torch.abs(f) for f in self._diffs(y_pred)]
         else:
-            assert self.penalty == 'l2', 'penalty can only be l1 or l2. Got: %s' % self.penalty
+            assert self.penalty == "l2", (
+                "penalty can only be l1 or l2. Got: %s" % self.penalty
+            )
             dif = [f * f for f in self._diffs(y_pred)]
 
         df = [torch.mean(torch.flatten(f, start_dim=1), dim=-1) for f in dif]
@@ -138,31 +321,37 @@ class Grad:
 
         return grad.mean()
 
+
 class NMI:
     def __init__(self):
         pass
-    
-    def loss(self,  img1, img2, bins=32):
+
+    def loss(self, img1, img2, bins=32):
         shape = img1.shape[2:]
-        img1 = (img1-torch.min(img1))/(torch.max(img1)-torch.min(img1))
-        img2 = (img2-torch.min(img2))/(torch.max(img2)-torch.min(img2))
+        img1 = (img1 - torch.min(img1)) / (torch.max(img1) - torch.min(img1))
+        img2 = (img2 - torch.min(img2)) / (torch.max(img2) - torch.min(img2))
 
         # 将图像转换为numpy数组
         img1_np = img1.numpy()
         img2_np = img2.numpy()
 
         # 计算直方图
-        hist_2d, x_edges, y_edges = np.histogram2d(img1_np.ravel(), img2_np.ravel(), bins=bins)
+        hist_2d, x_edges, y_edges = np.histogram2d(
+            img1_np.ravel(), img2_np.ravel(), bins=bins
+        )
 
         # 计算概率密度
         pxy = hist_2d / float(np.sum(hist_2d))
-        px = np.sum(pxy, axis=1) + 1/np.prod(np.array(shape))/10
-        py = np.sum(pxy, axis=0) + 1/np.prod(np.array(shape))/10
+        px = np.sum(pxy, axis=1) + 1 / np.prod(np.array(shape)) / 10
+        py = np.sum(pxy, axis=0) + 1 / np.prod(np.array(shape)) / 10
 
         # 计算互信息
         px_py = px[:, None] * py[None, :]
         non_zero_indices = pxy > 0
-        mi = np.sum(pxy[non_zero_indices] * np.log(pxy[non_zero_indices] / px_py[non_zero_indices]))
+        mi = np.sum(
+            pxy[non_zero_indices]
+            * np.log(pxy[non_zero_indices] / px_py[non_zero_indices])
+        )
 
         # 计算归一化互信息
         entropy_x = -np.sum(px * np.log(px))
@@ -171,13 +360,14 @@ class NMI:
 
         return nmi
 
+
 class PSNR:
     def __init__(self):
         pass
-    
-    def loss(self,  img1, img2):
-        img1 = (img1-torch.min(img1))/(torch.max(img1)-torch.min(img1))
-        img2 = (img2-torch.min(img2))/(torch.max(img2)-torch.min(img2))
+
+    def loss(self, img1, img2):
+        img1 = (img1 - torch.min(img1)) / (torch.max(img1) - torch.min(img1))
+        img2 = (img2 - torch.min(img2)) / (torch.max(img2) - torch.min(img2))
 
         img1 = img1.cpu().detach().numpy()
         img2 = img2.cpu().detach().numpy()
@@ -195,44 +385,47 @@ class PSNR:
 
         return psnr
 
+
 class SSIM:
     def __init__(self):
         pass
-    
-    def loss_old(self,  y_true, y_pred):
-        img_shape = y_true.shape
-        if len(img_shape)==4:
-            pixel_num = img_shape[2]*img_shape[3]
-        elif len(img_shape)==5:
-            pixel_num = img_shape[2]*img_shape[3]*img_shape[4]
 
-        y_true = (y_true-torch.min(y_true))/(torch.max(y_true)-torch.min(y_true))
-        y_pred = (y_pred-torch.min(y_pred))/(torch.max(y_pred)-torch.min(y_pred))
+    def loss_old(self, y_true, y_pred):
+        img_shape = y_true.shape
+        if len(img_shape) == 4:
+            pixel_num = img_shape[2] * img_shape[3]
+        elif len(img_shape) == 5:
+            pixel_num = img_shape[2] * img_shape[3] * img_shape[4]
+
+        y_true = (y_true - torch.min(y_true)) / (torch.max(y_true) - torch.min(y_true))
+        y_pred = (y_pred - torch.min(y_pred)) / (torch.max(y_pred) - torch.min(y_pred))
 
         mean_true = torch.mean(y_true)
         mean_pred = torch.mean(y_pred)
 
-        mu_true = (torch.sum((y_true-mean_true)**2)/(pixel_num-1))**0.5
-        mu_pred = (torch.sum((y_pred-mean_pred)**2)/(pixel_num-1))**0.5
-        mu_xy = torch.sum((y_true-mean_true)(y_pred-mean_pred))/(pixel_num-1)
+        mu_true = (torch.sum((y_true - mean_true) ** 2) / (pixel_num - 1)) ** 0.5
+        mu_pred = (torch.sum((y_pred - mean_pred) ** 2) / (pixel_num - 1)) ** 0.5
+        mu_xy = torch.sum((y_true - mean_true)(y_pred - mean_pred)) / (pixel_num - 1)
 
-        c1 = 0.01 ** 2
-        c2 = 0.03 ** 2
+        c1 = 0.01**2
+        c2 = 0.03**2
 
-        index = ((2*mean_true*mean_pred+c1)*(2*mu_xy+c2))/(((mean_true**2)+(mean_pred**2)+c1)*((mu_true**2)+(mu_pred**2)+c2))
+        index = ((2 * mean_true * mean_pred + c1) * (2 * mu_xy + c2)) / (
+            ((mean_true**2) + (mean_pred**2) + c1) * ((mu_true**2) + (mu_pred**2) + c2)
+        )
         return index
-    
+
     def loss(self, img1, img2):
-        if len(img1.shape)==4:
+        if len(img1.shape) == 4:
             return self.loss2D(img1, img2)
-        elif len(img1.shape)==5:
+        elif len(img1.shape) == 5:
             return self.loss3D(img1, img2)
-    
+
     def loss2D(self, img1, img2, window_size=11, sigma=1.5):
         # 数据归一化处理
-        img1 = (img1-torch.min(img1))/(torch.max(img1)-torch.min(img1))
-        img2 = (img2-torch.min(img2))/(torch.max(img2)-torch.min(img2))
-    
+        img1 = (img1 - torch.min(img1)) / (torch.max(img1) - torch.min(img1))
+        img2 = (img2 - torch.min(img2)) / (torch.max(img2) - torch.min(img2))
+
         # 创建高斯权重
         channel = img1.size(1)
         window = torch.FloatTensor(window_size, window_size).fill_(1)
@@ -243,67 +436,92 @@ class SSIM:
         # 计算均值
         mu1 = F.conv2d(img1, gaussian, padding=window_size // 2, groups=channel)
         mu2 = F.conv2d(img2, gaussian, padding=window_size // 2, groups=channel)
-    
+
         # 计算方差
         mu1_sq = mu1.pow(2)
         mu2_sq = mu2.pow(2)
         mu1_mu2 = mu1 * mu2
 
-        sigma1_sq = F.conv2d(img1 * img1, gaussian, padding=window_size // 2, groups=channel) - mu1_sq
-        sigma2_sq = F.conv2d(img2 * img2, gaussian, padding=window_size // 2, groups=channel) - mu2_sq
-        sigma12 = F.conv2d(img1 * img2, gaussian, padding=window_size // 2, groups=channel) - mu1_mu2
+        sigma1_sq = (
+            F.conv2d(img1 * img1, gaussian, padding=window_size // 2, groups=channel)
+            - mu1_sq
+        )
+        sigma2_sq = (
+            F.conv2d(img2 * img2, gaussian, padding=window_size // 2, groups=channel)
+            - mu2_sq
+        )
+        sigma12 = (
+            F.conv2d(img1 * img2, gaussian, padding=window_size // 2, groups=channel)
+            - mu1_mu2
+        )
 
         # SSIM公式
-        c1 = 0.01 ** 2
-        c2 = 0.03 ** 2
-        ssim_map = ((2 * mu1_mu2 + c1) * (2 * sigma12 + c2)) / ((mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2))
+        c1 = 0.01**2
+        c2 = 0.03**2
+        ssim_map = ((2 * mu1_mu2 + c1) * (2 * sigma12 + c2)) / (
+            (mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2)
+        )
 
         # 结构相似性指数
         return float(ssim_map.mean())
-    
+
     def loss3D(self, img1, img2, window_size=11, sigma=1.5):
         # 数据归一化处理
-        img1 = (img1-torch.min(img1))/(torch.max(img1)-torch.min(img1))
-        img2 = (img2-torch.min(img2))/(torch.max(img2)-torch.min(img2))
-    
+        img1 = (img1 - torch.min(img1)) / (torch.max(img1) - torch.min(img1))
+        img2 = (img2 - torch.min(img2)) / (torch.max(img2) - torch.min(img2))
+
         # 创建高斯权重
         channel = img1.size(1)
         window = torch.FloatTensor(window_size, window_size, window_size).fill_(1)
         gaussian = window.unsqueeze(0).unsqueeze(0)
-        gaussian = gaussian.expand(channel, 1, window_size, window_size, window_size).contiguous()
+        gaussian = gaussian.expand(
+            channel, 1, window_size, window_size, window_size
+        ).contiguous()
         gaussian = gaussian.to(img1.device, img1.dtype)
 
         pixel = 1
         for i in gaussian.shape:
-            pixel = pixel*i
-        gaussian = gaussian/pixel
-        
+            pixel = pixel * i
+        gaussian = gaussian / pixel
+
         # 计算均值
         mu1 = F.conv3d(img1, gaussian, padding=window_size // 2, groups=channel)
         mu2 = F.conv3d(img2, gaussian, padding=window_size // 2, groups=channel)
-    
+
         # 计算方差
         mu1_sq = mu1.pow(2)
         mu2_sq = mu2.pow(2)
         mu1_mu2 = mu1 * mu2
-        
+
         # sigma1_sq = F.conv3d((img1 - mu1)**2, gaussian/pixel, padding=window_size // 2, groups=channel)**0.5
         # sigma2_sq = F.conv3d((img2 - mu2)**2, gaussian/pixel, padding=window_size // 2, groups=channel)**0.5
         # sigma12 = F.conv3d((img1 - mu1) * (img2 - mu2), gaussian/pixel, padding=window_size // 2, groups=channel)**0.5
 
-        sigma1_sq = F.conv3d(img1 * img1, gaussian, padding=window_size // 2, groups=channel) - mu1_sq
-        sigma2_sq = F.conv3d(img2 * img2, gaussian, padding=window_size // 2, groups=channel) - mu2_sq
-        sigma12 = F.conv3d(img1 * img2, gaussian, padding=window_size // 2, groups=channel) - mu1_mu2
+        sigma1_sq = (
+            F.conv3d(img1 * img1, gaussian, padding=window_size // 2, groups=channel)
+            - mu1_sq
+        )
+        sigma2_sq = (
+            F.conv3d(img2 * img2, gaussian, padding=window_size // 2, groups=channel)
+            - mu2_sq
+        )
+        sigma12 = (
+            F.conv3d(img1 * img2, gaussian, padding=window_size // 2, groups=channel)
+            - mu1_mu2
+        )
 
         # SSIM公式
-        c1 = 0.01 ** 2
-        c2 = 0.03 ** 2
-        ssim_map = ((2 * mu1_mu2 + c1) * (2 * sigma12 + c2)) / ((mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2))
+        c1 = 0.01**2
+        c2 = 0.03**2
+        ssim_map = ((2 * mu1_mu2 + c1) * (2 * sigma12 + c2)) / (
+            (mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2)
+        )
         # ssim_map = ((2 * mu1 * mu2 + c1) * (2 * sigma12 + c2)) / ((mu1**2 + mu2**2 + c1) * (sigma1_sq**2 + sigma2_sq**2 + c2))
 
         # 结构相似性指数
         return ssim_map.mean()
-    
+
+
 def jacobian_determinant_vxm(disp):
     """
     jacobian determinant of a displacement field.
@@ -319,7 +537,7 @@ def jacobian_determinant_vxm(disp):
     # disp = disp.transpose(1, 2, 3, 0)
     volshape = disp.shape[:-1]
     nb_dims = len(volshape)
-    assert len(volshape) in (2, 3), 'flow has to be 2D or 3D'
+    assert len(volshape) in (2, 3), "flow has to be 2D or 3D"
 
     # compute grid
     grid_lst = nd.volsize2ndgrid(volshape)
@@ -342,11 +560,11 @@ def jacobian_determinant_vxm(disp):
         return Jdet0 - Jdet1 + Jdet2
 
     else:  # must be 2
-
         dfdx = J[0]
         dfdy = J[1]
 
         return dfdx[..., 0] * dfdy[..., 1] - dfdy[..., 0] * dfdx[..., 1]
+
 
 def SDLogJ(DVF):
     DVF = DVF.numpy()
@@ -354,8 +572,9 @@ def SDLogJ(DVF):
     jacobian_det = jacobian_determinant_vxm(np.squeeze(DVF))
     return np.std(np.log(jacobian_det))
 
+
 def PercentJ(DVF):
     DVF = DVF.numpy()
     # DVF = np.transpose(DVF, (0, 2, 3, 4, 1))
     jacobian_det = jacobian_determinant_vxm(np.squeeze(DVF))
-    return np.sum(jacobian_det<0)/jacobian_det.size
+    return np.sum(jacobian_det < 0) / jacobian_det.size
